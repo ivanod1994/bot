@@ -169,14 +169,10 @@ def send_signal(symbol, signal, rsi):
     exit_str = exit_.strftime("%H:%M:%S")
 
     msg = (
-        f"🚨 СИГНАЛ по {symbol.replace('=X','')}
-"
-        f"📈 Прогноз: {signal}
-"
-        f"📊 RSI: {rsi}
-"
-        f"⏱ Вход: {entry_str} (через {PREPARE_SECONDS} сек)
-"
+        f"🚨 СИГНАЛ по {symbol.replace('=X','')}\n"
+        f"📈 Прогноз: {signal}\n"
+        f"📊 RSI: {rsi}\n"
+        f"⏱ Вход: {entry_str} (через {PREPARE_SECONDS} сек)\n"
         f"⏳ Выход: {exit_str} (через 1 мин после входа)"
     )
 
