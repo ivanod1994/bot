@@ -72,16 +72,16 @@ def analyze(df):
     upper = bb.bollinger_hband().iloc[-1]
     lower = bb.bollinger_lband().iloc[-1]
 
-    if adx_v < 15:  # Упростим фильтр ADX
+    if adx_v < 10:  # Очень слабый рынок — пропускаем
         return "WAIT", round(rsi_v, 2)
 
-    # Упрощённые условия BUY
-    if (rsi_v < 45 and macd_val > signal_val and ema12_v > ema26_v and stoch_v < 30):
-        return "BUY (Soft) ✅", round(rsi_v, 2)
+    # BUY — условия ослаблены
+    if (rsi_v < 55 and macd_val > signal_val and ema12_v > ema26_v and stoch_v < 60):
+        return "BUY (Auto) ✅", round(rsi_v, 2)
 
-    # Упрощённые условия SELL
-    if (rsi_v > 55 and macd_val < signal_val and ema12_v < ema26_v and stoch_v > 70):
-        return "SELL (Soft) ✅", round(rsi_v, 2)
+    # SELL — условия ослаблены
+    if (rsi_v > 45 and macd_val < signal_val and ema12_v < ema26_v and stoch_v > 40):
+        return "SELL (Auto) ✅", round(rsi_v, 2)
 
     return "WAIT", round(rsi_v, 2)
 
