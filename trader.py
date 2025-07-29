@@ -10,6 +10,7 @@ from ta.volatility import BollingerBands, KeltnerChannel
 from datetime import datetime, timedelta
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+from datetime import timezone
 
 # === НАСТРОЙКИ ===
 TELEGRAM_TOKEN = "8246979603:AAGSP7b-YRol151GlZpfxyyS34rW5ncZJo4"
@@ -128,7 +129,7 @@ def clean_old_signals():
 # Сигнал
 
 def send_signal(symbol, signal, rsi):
-    now = datetime.utcnow() + timedelta(hours=3)
+    now = datetime.now(timezone.utc) + timedelta(hours=3)
     entry = now + timedelta(seconds=PREPARE_SECONDS)
     exit_ = entry + timedelta(minutes=1)
     entry_str = entry.strftime("%H:%M:%S")
