@@ -7,10 +7,9 @@ import os
 from ta.momentum import RSIIndicator, StochasticOscillator
 from ta.trend import MACD, EMAIndicator, ADXIndicator, CCIIndicator
 from ta.volatility import BollingerBands, KeltnerChannel
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from datetime import timezone
 
 # === НАСТРОЙКИ ===
 TELEGRAM_TOKEN = "8246979603:AAGSP7b-YRol151GlZpfxyyS34rW5ncZJo4"
@@ -73,19 +72,16 @@ def analyze(df):
     upper = bb.bollinger_hband().iloc[-1]
     lower = bb.bollinger_lband().iloc[-1]
 
-    # Если ADX слабый — не торговать
-    if adx_v < 20:
+    if adx_v < 15:  # Упростим фильтр ADX
         return "WAIT", round(rsi_v, 2)
 
-    # BUY по совокупности стратегий
-    if (rsi_v < 40 and macd_val > signal_val and ema12_v > ema26_v and
-        stoch_v < 20 and cci_v < -100 and price < lower):
-        return "BUY (Multi) ✅", round(rsi_v, 2)
+    # Упрощённые условия BUY
+    if (rsi_v < 45 and macd_val > signal_val and ema12_v > ema26_v and stoch_v < 30):
+        return "BUY (Soft) ✅", round(rsi_v, 2)
 
-    # SELL по совокупности стратегий
-    if (rsi_v > 60 and macd_val < signal_val and ema12_v < ema26_v and
-        stoch_v > 80 and cci_v > 100 and price > upper):
-        return "SELL (Multi) ✅", round(rsi_v, 2)
+    # Упрощённые условия SELL
+    if (rsi_v > 55 and macd_val < signal_val and ema12_v < ema26_v and stoch_v > 70):
+        return "SELL (Soft) ✅", round(rsi_v, 2)
 
     return "WAIT", round(rsi_v, 2)
 
@@ -109,7 +105,7 @@ def log_signal(symbol, signal, rsi, entry, exit):
 def clean_old_signals():
     if not os.path.exists(CSV_FILE):
         return
-    now = datetime.utcnow() + timedelta(hours=3)
+    now = datetime.now(timezone.utc) + timedelta(hours=3)
     rows = []
     with open(CSV_FILE, 'r') as f:
         reader = csv.reader(f)
