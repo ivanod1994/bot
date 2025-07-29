@@ -142,13 +142,9 @@ def log_signal(symbol, signal, rsi, entry, exit):
     with open(CSV_FILE, 'a', newline='') as f:
         csv.writer(f).writerow([symbol, signal, rsi, entry, exit])
 
-# Запись результата (для анализа)
-
 def log_result(symbol, signal, rsi, entry_time):
     with open(RESULT_LOG_FILE, 'a', newline='') as f:
         csv.writer(f).writerow([symbol, signal, rsi, entry_time, datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")])
-
-# Удаление старых сигналов
 
 def clean_old_signals():
     if not os.path.exists(CSV_FILE):
@@ -170,7 +166,18 @@ def clean_old_signals():
         writer.writerow(["Symbol", "Signal", "RSI", "Entry Time", "Exit Time"])
         writer.writerows(rows)
 
-# Сигнал
+# Агрегация и сигнал
+
+def already_sent(symbol, signal, entry_str):
+    if not os.path.exists(CSV_FILE):
+        return False
+    with open(CSV_FILE, 'r') as f:
+        reader = csv.reader(f)
+        next(reader)
+        for row in reader:
+            if row[0] == symbol and row[1] == signal and row[3] == entry_str:
+                return True
+    return False
 
 def send_signal(symbol, signal, rsi):
     now = datetime.now(LOCAL_TZ)
@@ -179,11 +186,18 @@ def send_signal(symbol, signal, rsi):
     entry_str = entry.strftime("%H:%M:%S")
     exit_str = exit_.strftime("%H:%M:%S")
 
+    if already_sent(symbol.replace('=X',''), signal, entry_str):
+        return
+
     msg = (
-        f"🚨 СИГНАЛ по {symbol.replace('=X','')}\n"
-        f"📈 Прогноз: {signal}\n"
-        f"📊 RSI: {rsi}\n"
-        f"⏱ Вход: {entry_str} (через {PREPARE_SECONDS} сек)\n"
+        f"🚨 СИГНАЛ по {symbol.replace('=X','')}
+"
+        f"📈 Прогноз: {signal}
+"
+        f"📊 RSI: {rsi}
+"
+        f"⏱ Вход: {entry_str} (через {PREPARE_SECONDS} сек)
+"
         f"⏳ Выход: {exit_str} (через 1 мин после входа)"
     )
 
@@ -191,6 +205,16 @@ def send_signal(symbol, signal, rsi):
     send_telegram_message(msg)
     log_signal(symbol.replace('=X',''), signal, rsi, entry_str, exit_str)
     log_result(symbol.replace('=X',''), signal, rsi, entry_str)
+
+    # Уведомление об окончании сделки
+    def notify_exit():
+        time.sleep(PREPARE_SECONDS + 60)
+        done_msg = f"✅ Завершена сделка по {symbol.replace('=X','')} ({signal.split()[0]}) в {exit_str}"
+        print(done_msg)
+        send_telegram_message(done_msg)
+
+    import threading
+    threading.Thread(target=notify_exit).start()
 
 # Главный цикл
 
