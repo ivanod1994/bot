@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import pytz
+import json
 
 # === НАСТРОЙКИ ===
 TELEGRAM_TOKEN = "8246979603:AAGSP7b-YRol151GlZpfxyyS34rW5ncZJo4"
@@ -23,7 +24,17 @@ PREPARE_SECONDS = 90  # ⏳ Подготовка перед входом
 RESULT_LOG_FILE = "results_log.csv"
 # =================
 
-MOSCOW_TZ = pytz.timezone('Europe/Moscow')
+def get_timezone():
+    try:
+        response = requests.get("https://ipinfo.io/json", timeout=5)
+        data = response.json()
+        timezone_str = data.get("timezone", "UTC")
+        return pytz.timezone(timezone_str)
+    except Exception as e:
+        print(f"Ошибка определения часового пояса: {e}")
+        return pytz.timezone("UTC")
+
+LOCAL_TZ = get_timezone()
 
 # Повторы запросов
 session = requests.Session()
@@ -142,7 +153,7 @@ def log_result(symbol, signal, rsi, entry_time):
 def clean_old_signals():
     if not os.path.exists(CSV_FILE):
         return
-    now = datetime.now(MOSCOW_TZ)
+    now = datetime.now(LOCAL_TZ)
     rows = []
     with open(CSV_FILE, 'r') as f:
         reader = csv.reader(f)
@@ -162,7 +173,7 @@ def clean_old_signals():
 # Сигнал
 
 def send_signal(symbol, signal, rsi):
-    now = datetime.now(MOSCOW_TZ)
+    now = datetime.now(LOCAL_TZ)
     entry = now + timedelta(seconds=PREPARE_SECONDS)
     exit_ = entry + timedelta(minutes=1)
     entry_str = entry.strftime("%H:%M:%S")
