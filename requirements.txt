@@ -1,0 +1,4 @@
+ta
+pandas
+numpy
+requests
