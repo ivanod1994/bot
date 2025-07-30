@@ -23,16 +23,15 @@ DELETE_AFTER_MINUTES = 5
 PREPARE_SECONDS = 90
 RESULT_LOG_FILE = "results_log.csv"
 MANUAL_TZ = "Africa/Algiers"
-MIN_ADX = 22  # Снижено для частоты
-ATR_MULTIPLIER = 1.0  # Снижено для частоты
-BB_WIDTH_MIN = 0.01  # Снижено для частоты
+MIN_ADX = 20
+BB_WIDTH_MIN = 0.005
 CONFIRMATION_CANDLES = 3
 RSI_BUY_THRESHOLD = 30
 RSI_SELL_THRESHOLD = 70
 PAYOUT = 0.85  # Уточните реальный процент выплаты
-TIMEOUT = 15
+TIMEOUT = 20
 MIN_SIGNAL_INTERVAL = 300  # 5 минут
-VOLUME_MULTIPLIER = 0.8  # Снижено для частоты
+VOLUME_MULTIPLIER = 0.5
 # =================
 
 data_cache = {}
@@ -64,7 +63,6 @@ def is_active_session():
 def is_news_time():
     try:
         # TODO: Замените на реальный API экономического календаря (например, Investing.com)
-        # Пример: https://api.investing.com/api/financial-calendar
         return False
     except:
         return False
@@ -154,15 +152,12 @@ def analyze(symbol, df, prev_df=None):
     volume_current = volume.iloc[-1]
 
     # Логирование индикаторов
-    print(f"[{symbol}] RSI: {rsi_v:.2f}, ADX: {adx_v:.2f}, Stochastic: {stoch_v:.2f}, MACD: {macd_val:.4f}, Signal: {signal_val:.4f}")
+    print(f"[{symbol}] RSI: {rsi_v:.2f}, ADX: {adx_v:.2f}, Stochastic: {stoch_v:.2f}, MACD: {macd_val:.4f}, Signal: {signal_val:.4f}, ATR: {atr_v:.4f}")
 
     # Фильтры
     reason = ""
     if adx_v < MIN_ADX:
         reason = f"ADX слишком низкий (< {MIN_ADX})"
-        return "WAIT", round(rsi_v, 2), 0, price, atr_v, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val
-    if atr_v < df['close'].std() * ATR_MULTIPLIER:
-        reason = "Низкая волатильность (ATR)"
         return "WAIT", round(rsi_v, 2), 0, price, atr_v, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val
     if bb_width < BB_WIDTH_MIN:
         reason = "Узкие Bollinger Bands"
@@ -194,15 +189,9 @@ def analyze(symbol, df, prev_df=None):
     if macd_val > signal_val + 0.02 and is_confirmed("BUY"):
         signal_strength += 2
         reason += "MACD бычий; "
-    if ema12_v > ema26_v and abs(ema12_v - ema26_v) > 0.01 * price:
-        signal_strength += 1
-        reason += "EMA12 > EMA26; "
-    if ema12.iloc[-2] < ema26.iloc[-2] and ema12_v > ema26_v:
-        signal_strength += 1
-        reason += "EMA пересечение бычье; "
-    if price > ema200_v:
-        signal_strength += 1
-        reason += "Цена > EMA200; "
+    if ema12_v > ema26_v and ema12.iloc[-2] < ema26.iloc[-2] and ema12_v > ema200_v:
+        signal_strength += 2
+        reason += "EMA пересечение бычье + выше EMA200; "
     if stoch_v < 20:
         signal_strength += 1
         reason += "Stochastic перепродан; "
@@ -219,7 +208,7 @@ def analyze(symbol, df, prev_df=None):
         signal_strength += 1
         reason += "Бычья свеча; "
 
-    if signal_strength >= 4:
+    if signal_strength >= 3:
         return "BUY (Strong)", round(rsi_v, 2), signal_strength, price, atr_v, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val
 
     signal_strength = 0
@@ -231,15 +220,9 @@ def analyze(symbol, df, prev_df=None):
     if macd_val < signal_val - 0.02 and is_confirmed("SELL"):
         signal_strength += 2
         reason += "MACD медвежий; "
-    if ema12_v < ema26_v and abs(ema12_v - ema26_v) > 0.01 * price:
-        signal_strength += 1
-        reason += "EMA12 < EMA26; "
-    if ema12.iloc[-2] > ema26.iloc[-2] and ema12_v < ema26_v:
-        signal_strength += 1
-        reason += "EMA пересечение медвежье; "
-    if price < ema200_v:
-        signal_strength += 1
-        reason += "Цена < EMA200; "
+    if ema12_v < ema26_v and ema12.iloc[-2] > ema26.iloc[-2] and ema12_v < ema200_v:
+        signal_strength += 2
+        reason += "EMA пересечение медвежье + ниже EMA200; "
     if stoch_v > 80:
         signal_strength += 1
         reason += "Stochastic перекуплен; "
@@ -256,7 +239,7 @@ def analyze(symbol, df, prev_df=None):
         signal_strength += 1
         reason += "Медвежья свеча; "
 
-    if signal_strength >= 4:
+    if signal_strength >= 3:
         return "SELL (Strong)", round(rsi_v, 2), signal_strength, price, atr_v, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val
 
     reason = "Недостаточно условий для сигнала"
@@ -296,10 +279,10 @@ def log_signal(symbol, signal, rsi, entry, exit):
     except Exception as e:
         print(f"Ошибка записи в CSV: {e}")
 
-def log_result(symbol, signal, rsi, entry_time, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val, outcome="PENDING"):
+def log_result(symbol, signal, rsi, entry_time, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val, atr_v, outcome="PENDING"):
     try:
         with open(RESULT_LOG_FILE, 'a', newline='', encoding='utf-8') as f:
-            csv.writer(f).writerow([symbol, signal, rsi, entry_time, datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"), reason, outcome, rsi_v, adx_v, stoch_v, macd_val, signal_val])
+            csv.writer(f).writerow([symbol, signal, rsi, entry_time, datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"), reason, outcome, rsi_v, adx_v, stoch_v, macd_val, signal_val, atr_v])
     except Exception as e:
         print(f"Ошибка записи в лог результатов: {e}")
 
@@ -334,7 +317,7 @@ def clean_old_signals():
 def calculate_win_rate():
     try:
         df = pd.read_csv(RESULT_LOG_FILE)
-        expected_columns = ["Symbol", "Signal", "RSI", "Entry Time", "Logged At", "Reason", "Outcome", "RSI_Value", "ADX_Value", "Stochastic_Value", "MACD_Value", "Signal_Value"]
+        expected_columns = ["Symbol", "Signal", "RSI", "Entry Time", "Logged At", "Reason", "Outcome", "RSI_Value", "ADX_Value", "Stochastic_Value", "MACD_Value", "Signal_Value", "ATR_Value"]
         if not all(col in df.columns for col in expected_columns):
             print(f"Ошибка: Неверная структура results_log.csv. Ожидаемые столбцы: {expected_columns}")
             with open(RESULT_LOG_FILE, 'w', newline='', encoding='utf-8') as f:
@@ -367,14 +350,14 @@ def can_generate_signal(symbol):
 def send_signal(symbol, signal, rsi, price, atr_v, df_5m, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val):
     try:
         now = datetime.now(LOCAL_TZ)
-        avg_atr = df_5m['close'].std() * ATR_MULTIPLIER
+        avg_atr = df_5m['close'].std()
         TRADE_DURATION_MINUTES = calculate_expiration(atr_v, avg_atr)
         entry = now + timedelta(seconds=PREPARE_SECONDS)
         exit_ = entry + timedelta(minutes=TRADE_DURATION_MINUTES)
         entry_str = entry.strftime("%H:%M:%S")
         exit_str = exit_.strftime("%H:%M:%S")
-        stop_loss = price - ATR_MULTIPLIER * atr_v if "BUY" in signal else price + ATR_MULTIPLIER * atr_v
-        take_profit = price + 2 * ATR_MULTIPLIER * atr_v if "BUY" in signal else price - 2 * ATR_MULTIPLIER * atr_v
+        stop_loss = price - atr_v if "BUY" in signal else price + atr_v
+        take_profit = price + 2 * atr_v if "BUY" in signal else price - 2 * atr_v
 
         msg = (
             f"🚨 СИГНАЛ по {symbol.replace('=X','')}\n"
@@ -390,7 +373,7 @@ def send_signal(symbol, signal, rsi, price, atr_v, df_5m, reason, rsi_v, adx_v, 
         print(msg)
         send_telegram_message(msg)
         log_signal(symbol.replace('=X',''), signal, rsi, entry_str, exit_str)
-        log_result(symbol.replace('=X',''), signal, rsi, entry_str, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val)
+        log_result(symbol.replace('=X',''), signal, rsi, entry_str, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val, atr_v)
         schedule_entry_alert(symbol.replace('=X',''), signal, rsi, entry)
     except Exception as e:
         print(f"❌ Ошибка в send_signal для {symbol}: {e}")
@@ -402,7 +385,7 @@ def main():
             csv.writer(f).writerow(["Symbol", "Signal", "RSI", "Entry Time", "Exit Time"])
     if not os.path.exists(RESULT_LOG_FILE):
         with open(RESULT_LOG_FILE, 'w', newline='', encoding='utf-8') as f:
-            csv.writer(f).writerow(["Symbol", "Signal", "RSI", "Entry Time", "Logged At", "Reason", "Outcome", "RSI_Value", "ADX_Value", "Stochastic_Value", "MACD_Value", "Signal_Value"])
+            csv.writer(f).writerow(["Symbol", "Signal", "RSI", "Entry Time", "Logged At", "Reason", "Outcome", "RSI_Value", "ADX_Value", "Stochastic_Value", "MACD_Value", "Signal_Value", "ATR_Value"])
 
     while True:
         print("🌀 Новый цикл анализа...")
@@ -415,16 +398,14 @@ def main():
             time.sleep(2)
             if df_5m is not None and can_generate_signal(symbol):
                 signal, rsi, strength, price, atr_v, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val = analyze(symbol, df_5m, df_15m)
-                if signal != "WAIT" and strength >= 4:
+                if signal != "WAIT" and strength >= 3:
                     signals.append((symbol, signal, rsi, strength, price, atr_v, df_5m, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val))
                 else:
                     print(f"[{symbol}] Сигнал не сгенерирован: {reason}")
             else:
                 print(f"[{symbol}] Пропуск анализа: отсутствуют данные 5m")
-        
-        for symbol, signal, rsi, strength, price, atr_v, df_5m, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val in signals:
-            send_signal(symbol, signal, rsi, price, atr_v, df_5m, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val)
-        
+        if not signals:
+            send_telegram_message("⚠️ Сигналы не сгенерированы в текущем цикле")
         calculate_win_rate()
         print("⏳ Ожидание...")
         time.sleep(INTERVAL)
