@@ -71,9 +71,7 @@ retry = Retry(total=5, backoff_factor=2, status_forcelist=[429, 502, 503, 504])
 session.mount('https://', HTTPAdapter(max_retries=retry))
 
 def is_active_session():
-    now = datetime.now(LOCAL_TZ)
-    hour = now.hour
-    return 8 <= hour <= 22
+    return True  # Временно отключаем фильтр JPY-сессии для теста
 
 def is_news_time():
     if not BEAUTIFULSOUP_AVAILABLE:
@@ -242,10 +240,6 @@ def analyze(symbol, df, prev_df=None):
         reason += "; Узкие Bollinger Bands"
         log_result(symbol.replace('=X',''), "WAIT", round(rsi_v, 2), datetime.now(LOCAL_TZ).strftime("%H:%M:%S"), reason, rsi_v, adx_v, stoch_v, macd_val, signal_val, atr_v)
         return "WAIT", round(rsi_v, 2), 0, price, atr_v, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val
-    if not is_active_session() and "JPY" in symbol:
-        reason += "; Торговля вне активной сессии для JPY"
-        log_result(symbol.replace('=X',''), "WAIT", round(rsi_v, 2), datetime.now(LOCAL_TZ).strftime("%H:%M:%S"), reason, rsi_v, adx_v, stoch_v, macd_val, signal_val, atr_v)
-        return "WAIT", round(rsi_v, 2), 0, price, atr_v, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val
     if is_news_time():
         reason += "; Новости, торговля приостановлена"
         log_result(symbol.replace('=X',''), "WAIT", round(rsi_v, 2), datetime.now(LOCAL_TZ).strftime("%H:%M:%S"), reason, rsi_v, adx_v, stoch_v, macd_val, signal_val, atr_v)
@@ -324,15 +318,6 @@ def analyze(symbol, df, prev_df=None):
     reason += "; Недостаточно условий для сигнала"
     log_result(symbol.replace('=X',''), "WAIT", round(rsi_v, 2), datetime.now(LOCAL_TZ).strftime("%H:%M:%S"), reason, rsi_v, adx_v, stoch_v, macd_val, signal_val, atr_v)
     return "WAIT", round(rsi_v, 2), 0, price, atr_v, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val
-
-def calculate_expiration(atr_v, avg_atr):
-    if atr_v > avg_atr * 1.2:
-        return 3
-    elif atr_v > avg_atr:
-        return 5
-    elif atr_v > avg_atr * 0.8:
-        return 7
-    return 10
 
 def send_telegram_message(msg):
     if not check_internet():
@@ -455,8 +440,7 @@ def can_generate_signal(symbol):
 def send_signal(symbol, signal, rsi, price, atr_v, df_5m, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val):
     try:
         now = datetime.now(LOCAL_TZ)
-        avg_atr = df_5m['close'].std()
-        TRADE_DURATION_MINUTES = calculate_expiration(atr_v, avg_atr)
+        TRADE_DURATION_MINUTES = 1  # Фиксированная экспирация 1 минута
         entry = now + timedelta(seconds=PREPARE_SECONDS)
         exit_ = entry + timedelta(minutes=TRADE_DURATION_MINUTES)
         entry_str = entry.strftime("%H:%M:%S")
