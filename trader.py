@@ -364,18 +364,78 @@ def schedule(symbol, signal, rsi, entry_dt):
     if delay > 0:
         threading.Timer(delay, alert).start()
 
-def log_signal(symbol, signal, rsi, entry, exit, entry_price, exit_price):
+def calculate_breakeven_probability(df_5m, atr_v, price, signal, trade_duration_minutes):
+    """
+    Рассчитывает вероятность успеха следующей сделки для перекрытия убытка от предыдущей.
+    :param df_5m: DataFrame с 5-минутными данными
+    :param atr_v: Текущий ATR
+    :param price: Цена входа
+    :param signal: Тип сигнала ("BUY" или "SELL")
+    :param trade_duration_minutes: Длительность сделки в минутах
+    :return: Вероятность перекрытия в процентах
+    """
+    try:
+        # Минимальное движение цены для успешной сделки
+        min_movement = atr_v * 0.1  # Минимальное движение для прибыльности
+        required_movement = min_movement / price  # Относительное движение
+
+        # Количество свечей за длительность сделки
+        candles_per_trade = int(trade_duration_minutes / 5)  # 5 минут на свечу
+        if candles_per_trade < 1:
+            candles_per_trade = 1
+
+        # Рассчитываем изменения цены
+        df_5m['price_change'] = df_5m['close'].pct_change(periods=candles_per_trade)
+        recent_changes = df_5m['price_change'].dropna().tail(100)  # Последние 100 движений
+
+        if len(recent_changes) < 2:
+            return 50.0  # Нейтральная вероятность при недостатке данных
+
+        # Оцениваем вероятность успеха следующей сделки после убыточной
+        success_count = 0
+        total_count = 0
+        for i in range(len(recent_changes) - 1):
+            current_change = recent_changes.iloc[i]
+            next_change = recent_changes.iloc[i + 1]
+            if signal in ["BUY", "BUY (Adaptive)"]:
+                # Убыточная сделка BUY: цена упала
+                if current_change < -required_movement:
+                    # Проверяем, была ли следующая сделка успешной (цена выросла)
+                    if next_change >= required_movement:
+                        success_count += 1
+                    total_count += 1
+            elif signal in ["SELL", "SELL (Adaptive)"]:
+                # Убыточная сделка SELL: цена выросла
+                if current_change > required_movement:
+                    # Проверяем, была ли следующая сделка успешной (цена упала)
+                    if next_change <= -required_movement:
+                        success_count += 1
+                    total_count += 1
+
+        # Вероятность перекрытия
+        probability = (success_count / total_count * 100) if total_count > 0 else 50.0
+
+        # Корректировка на волатильность
+        volatility_factor = atr_v / df_5m['close'].tail(50).std()
+        probability *= min(1.2, max(0.8, volatility_factor))  # Ограничиваем корректировку
+
+        return round(min(95.0, max(5.0, probability)), 2)  # Ограничиваем диапазон 5-95%
+    except Exception as e:
+        print(f"Ошибка расчета вероятности перекрытия: {e}")
+        return 50.0  # Нейтральная вероятность в случае ошибки
+
+def log_signal(symbol, signal, rsi, entry, exit, entry_price, exit_price, breakeven_probability):
     try:
         with open(CSV_FILE, 'a', newline='', encoding='utf-8') as f:
-            csv.writer(f).writerow([symbol, signal, rsi, entry, exit, entry_price, exit_price])
+            csv.writer(f).writerow([symbol, signal, rsi, entry, exit, entry_price, exit_price, breakeven_probability])
     except Exception as e:
         print(f"Ошибка записи в CSV: {e}")
 
-def log_result(symbol, signal, rsi, entry_time, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val, atr_v, entry_price, exit_price, outcome="PENDING"):
+def log_result(symbol, signal, rsi, entry_time, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val, atr_v, entry_price, exit_price, outcome="PENDING", breakeven_probability=0.0):
     for attempt in range(3):
         try:
             with open(RESULT_LOG_FILE, 'a', newline='', encoding='utf-8') as f:
-                csv.writer(f).writerow([symbol, signal, rsi, entry_time, datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"), reason, outcome, rsi_v, adx_v, stoch_v, macd_val, signal_val, atr_v, entry_price, exit_price])
+                csv.writer(f).writerow([symbol, signal, rsi, entry_time, datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"), reason, outcome, rsi_v, adx_v, stoch_v, macd_val, signal_val, atr_v, entry_price, exit_price, breakeven_probability])
             return
         except Exception as e:
             print(f"Ошибка записи в лог результатов (попытка {attempt+1}): {e}")
@@ -405,13 +465,13 @@ def clean_old_signals():
                     continue
         with open(CSV_FILE, 'w', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
-            writer.writerow(["Symbol", "Signal", "RSI", "Entry Time", "Exit Time", "Entry Price", "Exit Price"])
+            writer.writerow(["Symbol", "Signal", "RSI", "Entry Time", "Exit Time", "Entry Price", "Exit Price", "Breakeven_Probability"])
             writer.writerows(rows)
     except Exception as e:
         print(f"Ошибка очистки сигналов: {e}")
 
 def calculate_win_rate():
-    expected_columns = ["Symbol", "Signal", "RSI", "Entry Time", "Logged At", "Reason", "Outcome", "RSI_Value", "ADX_Value", "Stochastic_Value", "MACD_Value", "Signal_Value", "ATR_Value", "Entry_Price", "Exit_Price"]
+    expected_columns = ["Symbol", "Signal", "RSI", "Entry Time", "Logged At", "Reason", "Outcome", "RSI_Value", "ADX_Value", "Stochastic_Value", "MACD_Value", "Signal_Value", "ATR_Value", "Entry_Price", "Exit_Price", "Breakeven_Probability"]
     for attempt in range(3):
         try:
             if os.path.exists(RESULT_LOG_FILE):
@@ -468,6 +528,9 @@ def send_signal(symbol, signal, rsi, price, atr_v, df_5m, reason, rsi_v, adx_v, 
         entry_price = price
         exit_price = 0.0  # Будет обновлено после экспирации
 
+        # Рассчитываем вероятность перекрытия
+        breakeven_probability = calculate_breakeven_probability(df_5m, atr_v, price, signal, TRADE_DURATION_MINUTES)
+
         msg = (
             f"🚨 СИГНАЛ по {symbol.replace('=X','')}\n"
             f"📈 Прогноз: {signal}\n"
@@ -477,13 +540,14 @@ def send_signal(symbol, signal, rsi, price, atr_v, df_5m, reason, rsi_v, adx_v, 
             f"⏳ Выход: {exit_str} (через {TRADE_DURATION_MINUTES} мин после входа)\n"
             f"🛑 Stop Loss: {stop_loss:.4f}\n"
             f"🎯 Take Profit: {take_profit:.4f}\n"
-            f"💵 Цена входа: {entry_price:.4f}"
+            f"💵 Цена входа: {entry_price:.4f}\n"
+            f"📉 Вероятность перекрытия убытка: {breakeven_probability}%"
         )
 
         print(msg)
         if send_telegram_message(msg):
-            log_signal(symbol.replace('=X',''), signal, rsi, entry_str, exit_str, entry_price, exit_price)
-            log_result(symbol.replace('=X',''), signal, rsi, entry_str, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val, atr_v, entry_price, exit_price)
+            log_signal(symbol.replace('=X',''), signal, rsi, entry_str, exit_str, entry_price, exit_price, breakeven_probability)
+            log_result(symbol.replace('=X',''), signal, rsi, entry_str, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val, atr_v, entry_price, exit_price, breakeven_probability=breakeven_probability)
             schedule(symbol.replace('=X',''), signal, rsi, entry)
     except Exception as e:
         print(f"❌ Ошибка в send_signal для {symbol}: {e}")
@@ -492,10 +556,10 @@ def send_signal(symbol, signal, rsi, price, atr_v, df_5m, reason, rsi_v, adx_v, 
 def main():
     if not os.path.exists(CSV_FILE):
         with open(CSV_FILE, 'w', newline='', encoding='utf-8') as f:
-            csv.writer(f).writerow(["Symbol", "Signal", "RSI", "Entry Time", "Exit Time", "Entry Price", "Exit Price"])
+            csv.writer(f).writerow(["Symbol", "Signal", "RSI", "Entry Time", "Exit Time", "Entry Price", "Exit Price", "Breakeven_Probability"])
     if not os.path.exists(RESULT_LOG_FILE):
         with open(RESULT_LOG_FILE, 'w', newline='', encoding='utf-8') as f:
-            csv.writer(f).writerow(["Symbol", "Signal", "RSI", "Entry Time", "Logged At", "Reason", "Outcome", "RSI_Value", "ADX_Value", "Stochastic_Value", "MACD_Value", "Signal_Value", "ATR_Value", "Entry_Price", "Exit_Price"])
+            csv.writer(f).writerow(["Symbol", "Signal", "RSI", "Entry Time", "Logged At", "Reason", "Outcome", "RSI_Value", "ADX_Value", "Stochastic_Value", "MACD_Value", "Signal_Value", "ATR_Value", "Entry_Price", "Exit_Price", "Breakeven_Probability"])
 
     while True:
         print("🌀 Новый цикл анализа...")
@@ -513,10 +577,8 @@ def main():
                     signals.append((symbol, signal, rsi, price, atr_v, df_5m, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val))
                 else:
                     print(f"[{symbol}] Сигнал не сгенерирован: {reason}")
-                    send_telegram_message(f"[{symbol.replace('=X','')}] Сигнал не сгенерирован: {reason}")
             else:
                 print(f"[{symbol}] Пропуск анализа: отсутствуют данные 5m")
-                send_telegram_message(f"[{symbol.replace('=X','')}] Пропуск анализа: отсутствуют данные 5m")
         if not signals:
             send_telegram_message("⚠️ Сигналы не сгенерированы в текущем цикле")
         for sig in signals:
