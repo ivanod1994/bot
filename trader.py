@@ -39,7 +39,7 @@ MANUAL_TZ = "Africa/Algiers"
 CONFIRMATION_CANDLES = 4
 PAYOUT = 0.85
 TIMEOUT = 20
-MIN_SIGNAL_INTERVAL = 300
+MIN_SIGNAL_INTERVAL = 600  # Увеличено до 10 минут
 VOLUME_MULTIPLIER = float('inf')  # Отключаем фильтр объема
 ALPHA_VANTAGE_API_KEY = "YOUR_ALPHA_VANTAGE_API_KEY"  # Замените на ваш ключ
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"}
@@ -152,10 +152,10 @@ def get_data(symbol, interval="5m", period="7d"):
     if ALPHA_VANTAGE_AVAILABLE and ALPHA_VANTAGE_API_KEY != "YOUR_ALPHA_VANTAGE_API_KEY":
         for attempt in range(3):
             try:
-                print(f"⏳ Получаем данные по {symbol.replace('=X','')} (интервал 5min, Alpha Vantage, попытка {attempt+1})")
+                print(f"⏳ Получаем данные по {symbol.replace('=X','')} (интервал {interval}, Alpha Vantage, попытка {attempt+1})")
                 alpha_symbol = SYMBOLS_ALPHA[SYMBOLS.index(symbol)]
                 fx = ForeignExchange(key=ALPHA_VANTAGE_API_KEY)
-                data, _ = fx.get_currency_exchange_intraday(symbol=alpha_symbol, interval="5min", outputsize="full")
+                data, _ = fx.get_currency_exchange_intraday(symbol=alpha_symbol, interval=interval, outputsize="full")
                 
                 if not data:
                     print(f"[{symbol}] Пустые данные (Alpha Vantage): {data}")
@@ -189,7 +189,7 @@ def get_data(symbol, interval="5m", period="7d"):
     send_telegram_message(f"⚠️ Ошибка получения данных для {symbol.replace('=X','')} ({interval}): все источники недоступны")
     return None
 
-def analyze(symbol, df_5m, df_15m=None):
+def analyze(symbol, df_5m, df_15m=None, df_1h=None):
     # Проверка наличия достаточного количества данных
     if len(df_5m) < 50:
         reason = "Недостаточно данных для анализа (менее 50 свечей)"
@@ -234,15 +234,24 @@ def analyze(symbol, df_5m, df_15m=None):
     adx_mean = adx[-50:].mean()
     bb_width_series = (bb.bollinger_hband()[-50:] - bb.bollinger_lband()[-50:]) / close[-50:]
     bb_width_mean = bb_width_series.mean()
+    atr_mean = atr[-50:].mean()
 
     RSI_BUY_THRESHOLD = max(30, rsi_mean - rsi_std)  # Динамический RSI для покупки
     RSI_SELL_THRESHOLD = min(70, rsi_mean + rsi_std)  # Динамический RSI для продажи
-    MIN_ADX = max(10, adx_mean * 0.8)  # Динамический ADX
+    MIN_ADX = max(25, adx_mean * 0.8)  # Усиленный порог ADX
     BB_WIDTH_MIN = max(0.001, bb_width_mean * 0.5)  # Динамическая ширина Bollinger Bands
+    MIN_ATR = atr_mean * 0.5  # Минимальный ATR для волатильности
+
+    # Проверка тренда на H1
+    trend = "NEUTRAL"
+    if df_1h is not None:
+        ema12_h1 = EMAIndicator(df_1h['close'], window=12).ema_indicator().iloc[-1]
+        ema26_h1 = EMAIndicator(df_1h['close'], window=26).ema_indicator().iloc[-1]
+        trend = "BULLISH" if ema12_h1 > ema26_h1 else "BEARISH" if ema12_h1 < ema26_h1 else "NEUTRAL"
 
     # Логирование индикаторов
-    reason = f"RSI: {rsi_v:.2f}, ADX: {adx_v:.2f}, Stochastic: {stoch_v:.2f}, MACD: {macd_val:.4f}, Signal: {signal_val:.4f}, ATR: {atr_v:.4f}, BB_Width: {bb_width:.4f}"
-    reason += f"; Адаптивные пороги: RSI_BUY={RSI_BUY_THRESHOLD:.2f}, RSI_SELL={RSI_SELL_THRESHOLD:.2f}, MIN_ADX={MIN_ADX:.2f}, BB_WIDTH_MIN={BB_WIDTH_MIN:.4f}"
+    reason = f"RSI: {rsi_v:.2f}, ADX: {adx_v:.2f}, Stochastic: {stoch_v:.2f}, MACD: {macd_val:.4f}, Signal: {signal_val:.4f}, ATR: {atr_v:.4f}, BB_Width: {bb_width:.4f}, Trend H1: {trend}"
+    reason += f"; Адаптивные пороги: RSI_BUY={RSI_BUY_THRESHOLD:.2f}, RSI_SELL={RSI_SELL_THRESHOLD:.2f}, MIN_ADX={MIN_ADX:.2f}, BB_WIDTH_MIN={BB_WIDTH_MIN:.4f}, MIN_ATR={MIN_ATR:.4f}"
     print(f"[{symbol}] {reason}")
 
     # Фильтры
@@ -252,6 +261,10 @@ def analyze(symbol, df_5m, df_15m=None):
         return "WAIT", round(rsi_v, 2), 0, price, atr_v, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val
     if bb_width < BB_WIDTH_MIN:
         reason += "; Узкие Bollinger Bands"
+        log_result(symbol.replace('=X',''), "WAIT", round(rsi_v, 2), datetime.now(LOCAL_TZ).strftime("%H:%M:%S"), reason, rsi_v, adx_v, stoch_v, macd_val, signal_val, atr_v, price, 0.0)
+        return "WAIT", round(rsi_v, 2), 0, price, atr_v, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val
+    if atr_v < MIN_ATR:
+        reason += f"; ATR слишком низкий (< {MIN_ATR})"
         log_result(symbol.replace('=X',''), "WAIT", round(rsi_v, 2), datetime.now(LOCAL_TZ).strftime("%H:%M:%S"), reason, rsi_v, adx_v, stoch_v, macd_val, signal_val, atr_v, price, 0.0)
         return "WAIT", round(rsi_v, 2), 0, price, atr_v, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val
     if not is_active_session() and "JPY" in symbol:
@@ -294,12 +307,15 @@ def analyze(symbol, df_5m, df_15m=None):
         prev_ema26 = EMAIndicator(df_15m['close'], window=26).ema_indicator().iloc[-1]
         if prev_ema12 > prev_ema26:
             signal_strength += 1
-            reason += "Пред. EMA12 > EMA26; "
+            reason += "Пред. EMA12 > EMA26 (M15); "
+    if df_1h is not None and trend == "BULLISH":
+        signal_strength += 2
+        reason += "Бычий тренд на H1; "
     if close.iloc[-1] > open_price:
         signal_strength += 1
         reason += "Бычья свеча; "
 
-    if signal_strength >= 2:
+    if signal_strength >= 3:  # Увеличен порог
         return "BUY (Adaptive)", round(rsi_v, 2), signal_strength, price, atr_v, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val
 
     signal_strength = 0
@@ -325,12 +341,15 @@ def analyze(symbol, df_5m, df_15m=None):
         prev_ema26 = EMAIndicator(df_15m['close'], window=26).ema_indicator().iloc[-1]
         if prev_ema12 < prev_ema26:
             signal_strength += 1
-            reason += "Пред. EMA12 < EMA26; "
+            reason += "Пред. EMA12 < EMA26 (M15); "
+    if df_1h is not None and trend == "BEARISH":
+        signal_strength += 2
+        reason += "Медвежий тренд на H1; "
     if close.iloc[-1] < open_price:
         signal_strength += 1
         reason += "Медвежья свеча; "
 
-    if signal_strength >= 2:
+    if signal_strength >= 3:  # Увеличен порог
         return "SELL (Adaptive)", round(rsi_v, 2), signal_strength, price, atr_v, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val
 
     reason += "; Недостаточно условий для сигнала"
@@ -364,10 +383,11 @@ def schedule(symbol, signal, rsi, entry_dt):
     if delay > 0:
         threading.Timer(delay, alert).start()
 
-def calculate_breakeven_probability(df_5m, atr_v, price, signal, trade_duration_minutes):
+def calculate_breakeven_probability(df_5m, df_1h, atr_v, price, signal, trade_duration_minutes):
     """
     Рассчитывает вероятность успеха следующей сделки для перекрытия убытка от предыдущей.
     :param df_5m: DataFrame с 5-минутными данными
+    :param df_1h: DataFrame с 1-часовыми данными для тренда
     :param atr_v: Текущий ATR
     :param price: Цена входа
     :param signal: Тип сигнала ("BUY" или "SELL")
@@ -379,14 +399,16 @@ def calculate_breakeven_probability(df_5m, atr_v, price, signal, trade_duration_
         min_movement = atr_v * 0.1  # Минимальное движение для прибыльности
         required_movement = min_movement / price  # Относительное движение
 
-        # Количество свечей за длительность сделки
-        candles_per_trade = int(trade_duration_minutes / 5)  # 5 минут на свечу
-        if candles_per_trade < 1:
-            candles_per_trade = 1
+        # Проверка тренда на H1
+        trend = "NEUTRAL"
+        if df_1h is not None:
+            ema12_h1 = EMAIndicator(df_1h['close'], window=12).ema_indicator().iloc[-1]
+            ema26_h1 = EMAIndicator(df_1h['close'], window=26).ema_indicator().iloc[-1]
+            trend = "BULLISH" if ema12_h1 > ema26_h1 else "BEARISH" if ema12_h1 < ema26_h1 else "NEUTRAL"
 
         # Рассчитываем изменения цены
-        df_5m['price_change'] = df_5m['close'].pct_change(periods=candles_per_trade)
-        recent_changes = df_5m['price_change'].dropna().tail(100)  # Последние 100 движений
+        df_5m['price_change'] = df_5m['close'].pct_change(periods=1)  # 1 свеча = 5 минут
+        recent_changes = df_5m['price_change'].dropna().tail(200)  # Увеличено до 200
 
         if len(recent_changes) < 2:
             return 50.0  # Нейтральная вероятность при недостатке данных
@@ -415,8 +437,19 @@ def calculate_breakeven_probability(df_5m, atr_v, price, signal, trade_duration_
         # Вероятность перекрытия
         probability = (success_count / total_count * 100) if total_count > 0 else 50.0
 
+        # Корректировка на тренд
+        if signal in ["BUY", "BUY (Adaptive)"] and trend == "BULLISH":
+            probability *= 1.2  # Увеличиваем вероятность при бычьем тренде
+        elif signal in ["BUY", "BUY (Adaptive)"] and trend == "BEARISH":
+            probability *= 0.8  # Уменьшаем при медвежьем
+        elif signal in ["SELL", "SELL (Adaptive)"] and trend == "BEARISH":
+            probability *= 1.2  # Увеличиваем при медвежьем
+        elif signal in ["SELL", "SELL (Adaptive)"] and trend == "BULLISH":
+            probability *= 0.8  # Уменьшаем при бычьем
+
         # Корректировка на волатильность
-        volatility_factor = atr_v / df_5m['close'].tail(50).std()
+        atr_mean = df_5m['close'].tail(50).std()
+        volatility_factor = atr_v / atr_mean if atr_mean > 0 else 1.0
         probability *= min(1.2, max(0.8, volatility_factor))  # Ограничиваем корректировку
 
         return round(min(95.0, max(5.0, probability)), 2)  # Ограничиваем диапазон 5-95%
@@ -515,7 +548,7 @@ def can_generate_signal(symbol):
         return True
     return False
 
-def send_signal(symbol, signal, rsi, price, atr_v, df_5m, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val):
+def send_signal(symbol, signal, rsi, price, atr_v, df_5m, df_1h, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val, signal_strength):
     try:
         now = datetime.now(LOCAL_TZ)
         TRADE_DURATION_MINUTES = 1  # Фиксированная экспирация 1 минута
@@ -523,25 +556,38 @@ def send_signal(symbol, signal, rsi, price, atr_v, df_5m, reason, rsi_v, adx_v, 
         exit_ = entry + timedelta(minutes=TRADE_DURATION_MINUTES)
         entry_str = entry.strftime("%H:%M:%S")
         exit_str = exit_.strftime("%H:%M:%S")
-        stop_loss = price - atr_v if "BUY" in signal else price + atr_v
-        take_profit = price + 2 * atr_v if "BUY" in signal else price - 2 * atr_v
+        stop_loss = price - 1.5 * atr_v if "BUY" in signal else price + 1.5 * atr_v  # Динамический SL
+        take_profit = price + 3 * atr_v if "BUY" in signal else price - 3 * atr_v  # Динамический TP
         entry_price = price
         exit_price = 0.0  # Будет обновлено после экспирации
 
         # Рассчитываем вероятность перекрытия
-        breakeven_probability = calculate_breakeven_probability(df_5m, atr_v, price, signal, TRADE_DURATION_MINUTES)
+        breakeven_probability = calculate_breakeven_probability(df_5m, df_1h, atr_v, price, signal, TRADE_DURATION_MINUTES)
+
+        # Определяем тренд H1 для сообщения
+        trend = "NEUTRAL"
+        if df_1h is not None:
+            ema12_h1 = EMAIndicator(df_1h['close'], window=12).ema_indicator().iloc[-1]
+            ema26_h1 = EMAIndicator(df_1h['close'], window=26).ema_indicator().iloc[-1]
+            trend = "BULLISH" if ema12_h1 > ema26_h1 else "BEARISH" if ema12_h1 < ema26_h1 else "NEUTRAL"
+
+        # Предупреждение при низкой вероятности
+        warning = "⚠️ Низкая вероятность перекрытия! Будьте осторожны." if breakeven_probability < 50 else ""
 
         msg = (
             f"🚨 СИГНАЛ по {symbol.replace('=X','')}\n"
             f"📈 Прогноз: {signal}\n"
             f"📊 RSI: {rsi}\n"
+            f"💪 Сила сигнала: {signal_strength}/8\n"
             f"📝 Причина: {reason}\n"
+            f"📅 Тренд H1: {trend}\n"
             f"⏱ Вход: {entry_str} (через {PREPARE_SECONDS} сек)\n"
             f"⏳ Выход: {exit_str} (через {TRADE_DURATION_MINUTES} мин после входа)\n"
             f"🛑 Stop Loss: {stop_loss:.4f}\n"
             f"🎯 Take Profit: {take_profit:.4f}\n"
             f"💵 Цена входа: {entry_price:.4f}\n"
-            f"📉 Вероятность перекрытия убытка: {breakeven_probability}%"
+            f"📉 Вероятность перекрытия убытка: {breakeven_probability}%\n"
+            f"{warning}"
         )
 
         print(msg)
@@ -570,11 +616,13 @@ def main():
             time.sleep(2)
             df_15m = get_data(symbol, interval="15m", period="10d")
             time.sleep(2)
+            df_1h = get_data(symbol, interval="60m", period="30d")
+            time.sleep(2)
             if df_5m is not None and can_generate_signal(symbol):
-                signal, rsi, strength, price, atr_v, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val = analyze(symbol, df_5m, df_15m)
+                signal, rsi, strength, price, atr_v, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val = analyze(symbol, df_5m, df_15m, df_1h)
                 print(f"[{symbol}] Сигнал: {signal}, Сила: {strength}, Причина: {reason}")
-                if signal != "WAIT" and strength >= 2:
-                    signals.append((symbol, signal, rsi, price, atr_v, df_5m, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val))
+                if signal != "WAIT" and strength >= 3:
+                    signals.append((symbol, signal, rsi, price, atr_v, df_5m, df_1h, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val, strength))
                 else:
                     print(f"[{symbol}] Сигнал не сгенерирован: {reason}")
             else:
