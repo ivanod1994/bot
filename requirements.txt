@@ -1,4 +1,10 @@
-ta
+python-telegram-bot==20.0
+requests
 pandas
 numpy
-requests
+ta
+python-dateutil
+pytz
+beautifulsoup4
+alpha-vantage
+ccxt
