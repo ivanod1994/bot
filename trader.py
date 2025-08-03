@@ -11,7 +11,9 @@ from datetime import datetime, timedelta, timezone
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import pytz
-import threading
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+from telegram.error import TimedOut
 try:
     from bs4 import BeautifulSoup
     BEAUTIFULSOUP_AVAILABLE = True
@@ -30,34 +32,36 @@ TELEGRAM_TOKEN = "8246979603:AAGSP7b-YRol151GlZpfxyyS34rW5ncZJo4"
 CHAT_ID = "6677680988"
 SYMBOLS = ["EURJPY=X", "EURUSD=X", "CHFJPY=X", "USDCAD=X", "CADJPY=X", "GBPUSD=X", "AUDUSD=X"]
 SYMBOLS_ALPHA = ["EUR/JPY", "EUR/USD", "CHF/JPY", "USD/CAD", "CAD/JPY", "GBP/USD", "AUD/USD"]
-INTERVAL = 300  # 5 минут
+DEFAULT_TIMEFRAME = "5m"
 CSV_FILE = "signals.csv"
 DELETE_AFTER_MINUTES = 5
 PREPARE_SECONDS = 90
 RESULT_LOG_FILE = "results_log.csv"
 MANUAL_TZ = "Africa/Algiers"
-CONFIRMATION_CANDLES = 4
+CONFIRMATION_CANDLES = 2
 PAYOUT = 0.85
-TIMEOUT = 20
-MIN_SIGNAL_INTERVAL = 600  # Увеличено до 10 минут
-VOLUME_MULTIPLIER = float('inf')  # Отключаем фильтр объема
-ALPHA_VANTAGE_API_KEY = "YOUR_ALPHA_VANTAGE_API_KEY"  # Замените на ваш ключ
+TIMEOUT = 30
+MIN_SIGNAL_INTERVAL = 60
+VOLUME_MULTIPLIER = float('inf')
+ALPHA_VANTAGE_API_KEY = "YOUR_ALPHA_VANTAGE_API_KEY"
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"}
 # =================
 
 data_cache = {}
 last_signal_time = {symbol: None for symbol in SYMBOLS}
+user_selections = {}
 
 def get_timezone():
-    if MANUAL_TZ:
-        return pytz.timezone(MANUAL_TZ)
     try:
+        if MANUAL_TZ:
+            return pytz.timezone(MANUAL_TZ)
         response = requests.get("https://ipinfo.io/json", timeout=5)
+        response.raise_for_status()
         data = response.json()
         timezone_str = data.get("timezone", "UTC")
         return pytz.timezone(timezone_str)
     except Exception as e:
-        print(f"Ошибка определения часового пояса: {e}")
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] Ошибка определения часового пояса: {e}")
         return pytz.timezone("UTC")
 
 LOCAL_TZ = get_timezone()
@@ -73,7 +77,7 @@ def is_active_session():
 
 def is_news_time():
     if not BEAUTIFULSOUP_AVAILABLE:
-        print("Новостной фильтр недоступен: установите beautifulsoup4")
+        print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] BeautifulSoup недоступен, пропускаем проверку новостей")
         return False
     try:
         url = "https://www.investing.com/economic-calendar/"
@@ -90,42 +94,60 @@ def is_news_time():
                 event_time = datetime.strptime(time_str, "%H:%M").replace(
                     year=now.year, month=now.month, day=now.day, tzinfo=LOCAL_TZ
                 )
-                if abs((now - event_time).total_seconds()) < 1800:  # 30 минут
+                if abs((now - event_time).total_seconds()) < 1800:
+                    print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Обнаружены новости, торговля приостановлена")
                     return True
             except ValueError:
                 continue
         return False
     except Exception as e:
-        print(f"Ошибка проверки новостей: {e}")
+        print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Ошибка проверки новостей: {e}")
         return False
 
 def check_internet():
     try:
         requests.get("https://www.google.com", timeout=5)
         return True
-    except:
+    except Exception as e:
+        print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Нет интернета: {e}")
         return False
 
-def get_data(symbol, interval="5m", period="7d"):
-    cache_key = f"{symbol}_{interval}"
-    if cache_key in data_cache and (datetime.now() - data_cache[cache_key]['time']).seconds < 300:
-        print(f"[{symbol}] Используем кэшированные данные")
-        return data_cache[cache_key]['data']
-    
-    # Попытка через Yahoo Finance API
+def send_telegram_message(msg):
+    if not check_internet():
+        print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Нет интернета для отправки Telegram")
+        return False
     for attempt in range(3):
         try:
-            print(f"⏳ Получаем данные по {symbol.replace('=X','')} (интервал {interval}, Yahoo Finance, попытка {attempt+1})")
+            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+            response = requests.post(url, data={"chat_id": CHAT_ID, "text": msg}, timeout=TIMEOUT)
+            if response.status_code != 200:
+                print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Ошибка Telegram (попытка {attempt+1}): {response.json().get('description', 'Нет деталей')}")
+            else:
+                print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Telegram сообщение отправлено: {msg[:50]}...")
+                return True
+            time.sleep(2 ** attempt)
+        except Exception as e:
+            print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Ошибка Telegram (попытка {attempt+1}): {e}")
+    return False
+
+def get_data(symbol, interval=DEFAULT_TIMEFRAME, period="1d"):
+    cache_key = f"{symbol}_{interval}"
+    if cache_key in data_cache and (datetime.now() - data_cache[cache_key]['time']).seconds < 300:
+        print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Использую кэшированные данные для {symbol} ({interval})")
+        return data_cache[cache_key]['data']
+    
+    print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Загружаю данные для {symbol} ({interval})")
+    for attempt in range(3):
+        try:
             url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?range={period}&interval={interval}"
             response = session.get(url, headers=HEADERS, timeout=TIMEOUT)
-            print(f"[{symbol}] HTTP статус: {response.status_code}")
             if response.status_code == 429:
-                print(f"[{symbol}] Ошибка 429: Слишком много запросов, ожидание...")
-                time.sleep(5 ** attempt)
+                print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Ошибка 429, жду перед повтором (попытка {attempt+1})")
+                time.sleep(15 ** attempt)
                 continue
             data = response.json()
             if data['chart']['result'] is None:
-                print(f"[{symbol}] Ошибка данных: {data.get('chart', {}).get('error', 'Нет деталей ошибки')}")
+                print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Нет данных от Yahoo Finance для {symbol}")
                 continue
             result = data['chart']['result'][0]
             ts = result['timestamp']
@@ -139,86 +161,76 @@ def get_data(symbol, interval="5m", period="7d"):
                 "volume": quote['volume']
             })
             df.dropna(inplace=True)
-            if len(df) < 200:
-                print(f"[{symbol}] Недостаточно данных (Yahoo Finance): {len(df)} свечей")
+            if len(df) < 50:
+                print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Недостаточно данных для {symbol} ({len(df)} свечей)")
                 continue
             data_cache[cache_key] = {'data': df, 'time': datetime.now()}
+            print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Данные для {symbol} ({interval}) успешно загружены")
             return df
         except Exception as e:
-            print(f"[{symbol}] Ошибка Yahoo Finance: {str(e)}")
-            time.sleep(5 ** attempt)
+            print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] [{symbol}] Ошибка Yahoo Finance (попытка {attempt+1}): {str(e)}")
+            time.sleep(15 ** attempt)
     
-    # Резервный источник: Alpha Vantage
     if ALPHA_VANTAGE_AVAILABLE and ALPHA_VANTAGE_API_KEY != "YOUR_ALPHA_VANTAGE_API_KEY":
+        print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Пробую Alpha Vantage для {symbol} ({interval})")
         for attempt in range(3):
             try:
-                print(f"⏳ Получаем данные по {symbol.replace('=X','')} (интервал {interval}, Alpha Vantage, попытка {attempt+1})")
                 alpha_symbol = SYMBOLS_ALPHA[SYMBOLS.index(symbol)]
                 fx = ForeignExchange(key=ALPHA_VANTAGE_API_KEY)
                 data, _ = fx.get_currency_exchange_intraday(symbol=alpha_symbol, interval=interval, outputsize="full")
-                
                 if not data:
-                    print(f"[{symbol}] Пустые данные (Alpha Vantage): {data}")
+                    print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Нет данных от Alpha Vantage для {symbol}")
                     continue
-                
                 df = pd.DataFrame(data).transpose().reset_index()
                 df.columns = ['timestamp', 'open', 'high', 'low', 'close']
                 df['open'] = df['open'].astype(float)
                 df['high'] = df['high'].astype(float)
                 df['low'] = df['low'].astype(float)
                 df['close'] = df['close'].astype(float)
-                df['volume'] = 0  # Alpha Vantage не предоставляет объем для forex
+                df['volume'] = 0
                 df['timestamp'] = pd.to_datetime(df['timestamp']).dt.astimezone(LOCAL_TZ).dt.strftime("%Y-%m-%d %H:%M:%S")
                 df = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
                 df.dropna(inplace=True)
-                
-                if len(df) < 200:
-                    print(f"[{symbol}] Недостаточно данных (Alpha Vantage): {len(df)} свечей")
+                if len(df) < 50:
+                    print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Недостаточно данных от Alpha Vantage для {symbol} ({len(df)} свечей)")
                     continue
                 data_cache[cache_key] = {'data': df, 'time': datetime.now()}
+                print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Данные от Alpha Vantage для {symbol} ({interval}) успешно загружены")
                 return df
             except Exception as e:
-                print(f"[{symbol}] Ошибка Alpha Vantage: {str(e)}")
-                time.sleep(5 ** attempt)
-        send_telegram_message(f"⚠️ Ошибка получения данных для {symbol.replace('=X','')} ({interval}, Alpha Vantage): все попытки провалились")
-    
-    # Если все источники не сработали
-    if cache_key in data_cache:
-        print(f"[{symbol}] Используем старые кэшированные данные")
-        return data_cache[cache_key]['data']
-    send_telegram_message(f"⚠️ Ошибка получения данных для {symbol.replace('=X','')} ({interval}): все источники недоступны")
+                print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] [{symbol}] Ошибка Alpha Vantage (попытка {attempt+1}): {str(e)}")
+                time.sleep(15 ** attempt)
+    print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Не удалось загрузить данные для {symbol} ({interval})")
     return None
 
-def analyze(symbol, df_5m, df_15m=None, df_1h=None):
-    # Проверка наличия достаточного количества данных
+def analyze(symbol, df_5m, df_15m=None, df_1h=None, expiration=1):
+    print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Анализирую {symbol} для прогноза с экспирацией {expiration} мин...")
     if len(df_5m) < 50:
         reason = "Недостаточно данных для анализа (менее 50 свечей)"
-        log_result(symbol.replace('=X',''), "WAIT", 0, datetime.now(LOCAL_TZ).strftime("%H:%M:%S"), reason, 0, 0, 0, 0, 0, 0, 0, 0.0)
-        return "WAIT", 0, 0, 0, 0, reason, 0, 0, 0, 0, 0
+        print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] {symbol}: {reason}")
+        return "WAIT", 0, 0, 0, 0, reason, 0, 0, 0, 0, 0, 0
     
     close = df_5m['close']
     high = df_5m['high']
     low = df_5m['low']
     open = df_5m['open']
     
-    # Индикаторы
     rsi = RSIIndicator(close, window=14).rsi()
     macd = MACD(close, window_slow=26, window_fast=12, window_sign=9)
     bb = BollingerBands(close, window=20, window_dev=2)
+    ema5 = EMAIndicator(close, window=5).ema_indicator()
     ema12 = EMAIndicator(close, window=12).ema_indicator()
     ema26 = EMAIndicator(close, window=26).ema_indicator()
-    ema200 = EMAIndicator(close, window=200).ema_indicator()
     adx = ADXIndicator(high=high, low=low, close=close, window=14).adx()
     stochastic = StochasticOscillator(close=close, high=high, low=low, window=14, smooth_window=3).stoch()
     atr = AverageTrueRange(high=high, low=low, close=close, window=14).average_true_range()
 
-    # Текущие значения
     rsi_v = rsi.iloc[-1]
     macd_val = macd.macd().iloc[-1]
     signal_val = macd.macd_signal().iloc[-1]
+    ema5_v = ema5.iloc[-1]
     ema12_v = ema12.iloc[-1]
     ema26_v = ema26.iloc[-1]
-    ema200_v = ema200.iloc[-1]
     adx_v = adx.iloc[-1]
     stoch_v = stochastic.iloc[-1]
     price = close.iloc[-1]
@@ -228,55 +240,57 @@ def analyze(symbol, df_5m, df_15m=None, df_1h=None):
     atr_v = atr.iloc[-1]
     bb_width = (upper_bb - lower_bb) / price
 
-    # Адаптивные пороги на основе последних 50 свечей
-    rsi_mean = rsi[-50:].mean()
-    rsi_std = rsi[-50:].std()
-    adx_mean = adx[-50:].mean()
-    bb_width_series = (bb.bollinger_hband()[-50:] - bb.bollinger_lband()[-50:]) / close[-50:]
+    # Прогноз движения цены на основе ATR
+    atr_mean = atr[-10:].mean()
+    expected_move = atr_mean * (expiration / 5.0)  # Масштабируем ATR на экспирацию (5m базовый таймфрейм)
+    price_high = price + expected_move
+    price_low = price - expected_move
+    success_probability = 0.65  # Базовая вероятность успеха (на основе исторической волатильности)
+
+    rsi_mean = rsi[-10:].mean()
+    rsi_std = rsi[-10:].std()
+    adx_mean = adx[-10:].mean()
+    bb_width_series = (bb.bollinger_hband()[-10:] - bb.bollinger_lband()[-10:]) / close[-10:]
     bb_width_mean = bb_width_series.mean()
-    atr_mean = atr[-50:].mean()
+    atr_mean = atr[-10:].mean()
 
-    RSI_BUY_THRESHOLD = max(30, rsi_mean - rsi_std)  # Динамический RSI для покупки
-    RSI_SELL_THRESHOLD = min(70, rsi_mean + rsi_std)  # Динамический RSI для продажи
-    MIN_ADX = max(25, adx_mean * 0.8)  # Усиленный порог ADX
-    BB_WIDTH_MIN = max(0.001, bb_width_mean * 0.5)  # Динамическая ширина Bollinger Bands
-    MIN_ATR = atr_mean * 0.5  # Минимальный ATR для волатильности
+    RSI_BUY_THRESHOLD = max(30, rsi_mean - rsi_std)
+    RSI_SELL_THRESHOLD = min(70, rsi_mean + rsi_std)
+    MIN_ADX = max(20, adx_mean * 0.7)
+    BB_WIDTH_MIN = max(0.0005, bb_width_mean * 0.5)
+    MIN_ATR = atr_mean * 0.5
 
-    # Проверка тренда на H1
     trend = "NEUTRAL"
-    if df_1h is not None:
-        ema12_h1 = EMAIndicator(df_1h['close'], window=12).ema_indicator().iloc[-1]
-        ema26_h1 = EMAIndicator(df_1h['close'], window=26).ema_indicator().iloc[-1]
-        trend = "BULLISH" if ema12_h1 > ema26_h1 else "BEARISH" if ema12_h1 < ema26_h1 else "NEUTRAL"
+    if df_15m is not None:
+        ema5_m15 = EMAIndicator(df_15m['close'], window=5).ema_indicator().iloc[-1]
+        ema12_m15 = EMAIndicator(df_15m['close'], window=12).ema_indicator().iloc[-1]
+        trend = "BULLISH" if ema5_m15 > ema12_m15 else "BEARISH" if ema5_m15 < ema12_m15 else "NEUTRAL"
 
-    # Логирование индикаторов
-    reason = f"RSI: {rsi_v:.2f}, ADX: {adx_v:.2f}, Stochastic: {stoch_v:.2f}, MACD: {macd_val:.4f}, Signal: {signal_val:.4f}, ATR: {atr_v:.4f}, BB_Width: {bb_width:.4f}, Trend H1: {trend}"
-    reason += f"; Адаптивные пороги: RSI_BUY={RSI_BUY_THRESHOLD:.2f}, RSI_SELL={RSI_SELL_THRESHOLD:.2f}, MIN_ADX={MIN_ADX:.2f}, BB_WIDTH_MIN={BB_WIDTH_MIN:.4f}, MIN_ATR={MIN_ATR:.4f}"
-    print(f"[{symbol}] {reason}")
+    reason = (f"RSI: {rsi_v:.2f}, ADX: {adx_v:.2f}, Stochastic: {stoch_v:.2f}, MACD: {macd_val:.4f}, "
+              f"Signal: {signal_val:.4f}, ATR: {atr_v:.4f}, BB_Width: {bb_width:.4f}, Trend M15: {trend}, "
+              f"Expected Move: ±{expected_move:.4f}, Success Probability: {success_probability:.2%}")
 
-    # Фильтры
     if adx_v < MIN_ADX:
         reason += f"; ADX слишком низкий (< {MIN_ADX})"
-        log_result(symbol.replace('=X',''), "WAIT", round(rsi_v, 2), datetime.now(LOCAL_TZ).strftime("%H:%M:%S"), reason, rsi_v, adx_v, stoch_v, macd_val, signal_val, atr_v, price, 0.0)
-        return "WAIT", round(rsi_v, 2), 0, price, atr_v, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val
+        print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] {symbol}: {reason}")
+        return "WAIT", round(rsi_v, 2), 0, price, atr_v, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val, success_probability
     if bb_width < BB_WIDTH_MIN:
         reason += "; Узкие Bollinger Bands"
-        log_result(symbol.replace('=X',''), "WAIT", round(rsi_v, 2), datetime.now(LOCAL_TZ).strftime("%H:%M:%S"), reason, rsi_v, adx_v, stoch_v, macd_val, signal_val, atr_v, price, 0.0)
-        return "WAIT", round(rsi_v, 2), 0, price, atr_v, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val
+        print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] {symbol}: {reason}")
+        return "WAIT", round(rsi_v, 2), 0, price, atr_v, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val, success_probability
     if atr_v < MIN_ATR:
         reason += f"; ATR слишком низкий (< {MIN_ATR})"
-        log_result(symbol.replace('=X',''), "WAIT", round(rsi_v, 2), datetime.now(LOCAL_TZ).strftime("%H:%M:%S"), reason, rsi_v, adx_v, stoch_v, macd_val, signal_val, atr_v, price, 0.0)
-        return "WAIT", round(rsi_v, 2), 0, price, atr_v, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val
+        print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] {symbol}: {reason}")
+        return "WAIT", round(rsi_v, 2), 0, price, atr_v, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val, success_probability
     if not is_active_session() and "JPY" in symbol:
         reason += "; Торговля вне активной сессии для JPY"
-        log_result(symbol.replace('=X',''), "WAIT", round(rsi_v, 2), datetime.now(LOCAL_TZ).strftime("%H:%M:%S"), reason, rsi_v, adx_v, stoch_v, macd_val, signal_val, atr_v, price, 0.0)
-        return "WAIT", round(rsi_v, 2), 0, price, atr_v, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val
+        print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] {symbol}: {reason}")
+        return "WAIT", round(rsi_v, 2), 0, price, atr_v, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val, success_probability
     if is_news_time():
         reason += "; Новости, торговля приостановлена"
-        log_result(symbol.replace('=X',''), "WAIT", round(rsi_v, 2), datetime.now(LOCAL_TZ).strftime("%H:%M:%S"), reason, rsi_v, adx_v, stoch_v, macd_val, signal_val, atr_v, price, 0.0)
-        return "WAIT", round(rsi_v, 2), 0, price, atr_v, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val
+        print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] {symbol}: {reason}")
+        return "WAIT", round(rsi_v, 2), 0, price, atr_v, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val, success_probability
 
-    # Подтверждение сигнала
     def is_confirmed(signal_type, candles=CONFIRMATION_CANDLES):
         if signal_type == "BUY":
             return all(macd.macd().iloc[-i] > macd.macd_signal().iloc[-i] for i in range(1, candles + 1))
@@ -286,355 +300,267 @@ def analyze(symbol, df_5m, df_15m=None, df_1h=None):
 
     signal_strength = 0
     reason = ""
-    # Условия для покупки
     if rsi_v < RSI_BUY_THRESHOLD:
         signal_strength += 1
         reason += "RSI перепродан; "
-    if macd_val > signal_val + 0.01 and is_confirmed("BUY"):
+    if macd_val > signal_val + 0.005 and is_confirmed("BUY"):
         signal_strength += 2
         reason += "MACD бычий; "
-    if ema12_v > ema26_v and ema12.iloc[-2] < ema26.iloc[-2] and ema12_v > ema200_v:
+    if ema5_v > ema12_v and ema5.iloc[-2] <= ema12.iloc[-2]:
         signal_strength += 2
-        reason += "EMA пересечение бычье + выше EMA200; "
-    if stoch_v < 20:
+        reason += "EMA5 пересекает EMA12 вверх; "
+    if stoch_v < 30:
         signal_strength += 1
         reason += "Stochastic перепродан; "
-    if price < lower_bb * 1.01:
+    if price < lower_bb * 1.005:
         signal_strength += 1
         reason += "Цена ниже Bollinger; "
-    if df_15m is not None:
-        prev_ema12 = EMAIndicator(df_15m['close'], window=12).ema_indicator().iloc[-1]
-        prev_ema26 = EMAIndicator(df_15m['close'], window=26).ema_indicator().iloc[-1]
-        if prev_ema12 > prev_ema26:
-            signal_strength += 1
-            reason += "Пред. EMA12 > EMA26 (M15); "
-    if df_1h is not None and trend == "BULLISH":
-        signal_strength += 2
-        reason += "Бычий тренд на H1; "
+    if df_15m is not None and trend == "BULLISH":
+        signal_strength += 1
+        reason += "Бычий тренд на M15; "
     if close.iloc[-1] > open_price:
         signal_strength += 1
         reason += "Бычья свеча; "
+    if len(close) >= 3 and close.iloc[-1] > close.iloc[-2] > close.iloc[-3]:
+        signal_strength += 1
+        reason += "Рост цены последние 3 свечи; "
 
-    if signal_strength >= 3:  # Увеличен порог
-        return "BUY (Adaptive)", round(rsi_v, 2), signal_strength, price, atr_v, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val
+    # Проверка прогноза на основе экспирации
+    if signal_strength >= 3:
+        if price_high > price * 1.0005:  # Проверяем, что прогнозируемая цена выше текущей на 0.05%
+            signal_strength += 1
+            reason += f"Прогноз роста на {expiration} мин; "
+        else:
+            reason += f"Прогноз не подтверждает рост на {expiration} мин; "
+            signal_strength -= 1
+
+        print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] {symbol}: BUY сигнал, сила={signal_strength}, причина={reason}")
+        return "BUY", round(rsi_v, 2), signal_strength, price, atr_v, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val, success_probability
 
     signal_strength = 0
     reason = ""
-    # Условия для продажи
     if rsi_v > RSI_SELL_THRESHOLD:
         signal_strength += 1
         reason += "RSI перекуплен; "
-    if macd_val < signal_val - 0.01 and is_confirmed("SELL"):
+    if macd_val < signal_val - 0.005 and is_confirmed("SELL"):
         signal_strength += 2
         reason += "MACD медвежий; "
-    if ema12_v < ema26_v and ema12.iloc[-2] > ema26.iloc[-2] and ema12_v < ema200_v:
+    if ema5_v < ema12_v and ema5.iloc[-2] >= ema12.iloc[-2]:
         signal_strength += 2
-        reason += "EMA пересечение медвежье + ниже EMA200; "
-    if stoch_v > 80:
+        reason += "EMA5 пересекает EMA12 вниз; "
+    if stoch_v > 70:
         signal_strength += 1
         reason += "Stochastic перекуплен; "
-    if price > upper_bb * 0.99:
+    if price > upper_bb * 0.995:
         signal_strength += 1
         reason += "Цена выше Bollinger; "
-    if df_15m is not None:
-        prev_ema12 = EMAIndicator(df_15m['close'], window=12).ema_indicator().iloc[-1]
-        prev_ema26 = EMAIndicator(df_15m['close'], window=26).ema_indicator().iloc[-1]
-        if prev_ema12 < prev_ema26:
-            signal_strength += 1
-            reason += "Пред. EMA12 < EMA26 (M15); "
-    if df_1h is not None and trend == "BEARISH":
-        signal_strength += 2
-        reason += "Медвежий тренд на H1; "
+    if df_15m is not None and trend == "BEARISH":
+        signal_strength += 1
+        reason += "Медвежий тренд на M15; "
     if close.iloc[-1] < open_price:
         signal_strength += 1
         reason += "Медвежья свеча; "
+    if len(close) >= 3 and close.iloc[-1] < close.iloc[-2] < close.iloc[-3]:
+        signal_strength += 1
+        reason += "Падение цены последние 3 свечи; "
 
-    if signal_strength >= 3:  # Увеличен порог
-        return "SELL (Adaptive)", round(rsi_v, 2), signal_strength, price, atr_v, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val
+    if signal_strength >= 3:
+        if price_low < price * 0.9995:  # Проверяем, что прогнозируемая цена ниже текущей на 0.05%
+            signal_strength += 1
+            reason += f"Прогноз падения на {expiration} мин; "
+        else:
+            reason += f"Прогноз не подтверждает падение на {expiration} мин; "
+            signal_strength -= 1
+
+        print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] {symbol}: SELL сигнал, сила={signal_strength}, причина={reason}")
+        return "SELL", round(rsi_v, 2), signal_strength, price, atr_v, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val, success_probability
 
     reason += "; Недостаточно условий для сигнала"
-    log_result(symbol.replace('=X',''), "WAIT", round(rsi_v, 2), datetime.now(LOCAL_TZ).strftime("%H:%M:%S"), reason, rsi_v, adx_v, stoch_v, macd_val, signal_val, atr_v, price, 0.0)
-    return "WAIT", round(rsi_v, 2), 0, price, atr_v, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val
+    print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] {symbol}: {reason}")
+    return "WAIT", round(rsi_v, 2), 0, price, atr_v, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val, success_probability
 
-def send_telegram_message(msg):
-    if not check_internet():
-        print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Нет интернета для отправки Telegram")
-        return False
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Получена команда /start от chat_id={update.message.chat_id}")
     for attempt in range(3):
         try:
-            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-            response = requests.post(url, data={"chat_id": CHAT_ID, "text": msg}, timeout=TIMEOUT)
-            if response.status_code != 200:
-                print(f"Ошибка Telegram (попытка {attempt+1}): {response.json().get('description', 'Нет деталей')}")
-            else:
-                print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Telegram сообщение отправлено: {msg[:50]}...")
-                return True
-            time.sleep(2 ** attempt)
-        except Exception as e:
-            print(f"Ошибка Telegram (попытка {attempt+1}): {e}")
-    return False
-
-def schedule(symbol, signal, rsi, entry_dt):
-    def alert():
-        alert_msg = f"⏰ ВХОД в сделку по {symbol} ({signal}) прямо сейчас ({entry_dt.strftime('%H:%M:%S')})"
-        send_telegram_message(alert_msg)
-        print(alert_msg)
-    delay = (entry_dt - datetime.now(LOCAL_TZ)).total_seconds()
-    if delay > 0:
-        threading.Timer(delay, alert).start()
-
-def calculate_breakeven_probability(df_5m, df_1h, atr_v, price, signal, trade_duration_minutes):
-    """
-    Рассчитывает вероятность успеха следующей сделки для перекрытия убытка от предыдущей.
-    :param df_5m: DataFrame с 5-минутными данными
-    :param df_1h: DataFrame с 1-часовыми данными для тренда
-    :param atr_v: Текущий ATR
-    :param price: Цена входа
-    :param signal: Тип сигнала ("BUY" или "SELL")
-    :param trade_duration_minutes: Длительность сделки в минутах
-    :return: Вероятность перекрытия в процентах
-    """
-    try:
-        # Минимальное движение цены для успешной сделки
-        min_movement = atr_v * 0.1  # Минимальное движение для прибыльности
-        required_movement = min_movement / price  # Относительное движение
-
-        # Проверка тренда на H1
-        trend = "NEUTRAL"
-        if df_1h is not None:
-            ema12_h1 = EMAIndicator(df_1h['close'], window=12).ema_indicator().iloc[-1]
-            ema26_h1 = EMAIndicator(df_1h['close'], window=26).ema_indicator().iloc[-1]
-            trend = "BULLISH" if ema12_h1 > ema26_h1 else "BEARISH" if ema12_h1 < ema26_h1 else "NEUTRAL"
-
-        # Рассчитываем изменения цены
-        df_5m['price_change'] = df_5m['close'].pct_change(periods=1)  # 1 свеча = 5 минут
-        recent_changes = df_5m['price_change'].dropna().tail(200)  # Увеличено до 200
-
-        if len(recent_changes) < 2:
-            return 50.0  # Нейтральная вероятность при недостатке данных
-
-        # Оцениваем вероятность успеха следующей сделки после убыточной
-        success_count = 0
-        total_count = 0
-        for i in range(len(recent_changes) - 1):
-            current_change = recent_changes.iloc[i]
-            next_change = recent_changes.iloc[i + 1]
-            if signal in ["BUY", "BUY (Adaptive)"]:
-                # Убыточная сделка BUY: цена упала
-                if current_change < -required_movement:
-                    # Проверяем, была ли следующая сделка успешной (цена выросла)
-                    if next_change >= required_movement:
-                        success_count += 1
-                    total_count += 1
-            elif signal in ["SELL", "SELL (Adaptive)"]:
-                # Убыточная сделка SELL: цена выросла
-                if current_change > required_movement:
-                    # Проверяем, была ли следующая сделка успешной (цена упала)
-                    if next_change <= -required_movement:
-                        success_count += 1
-                    total_count += 1
-
-        # Вероятность перекрытия
-        probability = (success_count / total_count * 100) if total_count > 0 else 50.0
-
-        # Корректировка на тренд
-        if signal in ["BUY", "BUY (Adaptive)"] and trend == "BULLISH":
-            probability *= 1.2  # Увеличиваем вероятность при бычьем тренде
-        elif signal in ["BUY", "BUY (Adaptive)"] and trend == "BEARISH":
-            probability *= 0.8  # Уменьшаем при медвежьем
-        elif signal in ["SELL", "SELL (Adaptive)"] and trend == "BEARISH":
-            probability *= 1.2  # Увеличиваем при медвежьем
-        elif signal in ["SELL", "SELL (Adaptive)"] and trend == "BULLISH":
-            probability *= 0.8  # Уменьшаем при бычьем
-
-        # Корректировка на волатильность
-        atr_mean = df_5m['close'].tail(50).std()
-        volatility_factor = atr_v / atr_mean if atr_mean > 0 else 1.0
-        probability *= min(1.2, max(0.8, volatility_factor))  # Ограничиваем корректировку
-
-        return round(min(95.0, max(5.0, probability)), 2)  # Ограничиваем диапазон 5-95%
-    except Exception as e:
-        print(f"Ошибка расчета вероятности перекрытия: {e}")
-        return 50.0  # Нейтральная вероятность в случае ошибки
-
-def log_signal(symbol, signal, rsi, entry, exit, entry_price, exit_price, breakeven_probability):
-    try:
-        with open(CSV_FILE, 'a', newline='', encoding='utf-8') as f:
-            csv.writer(f).writerow([symbol, signal, rsi, entry, exit, entry_price, exit_price, breakeven_probability])
-    except Exception as e:
-        print(f"Ошибка записи в CSV: {e}")
-
-def log_result(symbol, signal, rsi, entry_time, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val, atr_v, entry_price, exit_price, outcome="PENDING", breakeven_probability=0.0):
-    for attempt in range(3):
-        try:
-            with open(RESULT_LOG_FILE, 'a', newline='', encoding='utf-8') as f:
-                csv.writer(f).writerow([symbol, signal, rsi, entry_time, datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"), reason, outcome, rsi_v, adx_v, stoch_v, macd_val, signal_val, atr_v, entry_price, exit_price, breakeven_probability])
+            await update.message.reply_text(
+                "Добро пожаловать в торгового бота! Прогнозы с выбранной экспирацией. Используйте кнопки ниже для выбора пары и экспирации.",
+                reply_markup=get_main_menu()
+            )
             return
+        except TimedOut as e:
+            print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Тайм-аут в /start (попытка {attempt+1}): {e}")
+            if attempt < 2:
+                time.sleep(5 * (2 ** attempt))
+            continue
         except Exception as e:
-            print(f"Ошибка записи в лог результатов (попытка {attempt+1}): {e}")
-            time.sleep(1)
-    send_telegram_message(f"⚠️ Ошибка записи в results_log.csv для {symbol}: {str(e)}")
+            print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Ошибка в /start (попытка {attempt+1}): {e}")
+            if attempt < 2:
+                time.sleep(5 * (2 ** attempt))
+            continue
+    print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Не удалось отправить ответ на /start после 3 попыток")
+    send_telegram_message("Ошибка: не удалось ответить на /start. Проверьте соединение или настройки бота.")
 
-def clean_old_signals():
-    if not os.path.exists(CSV_FILE):
-        return
-    now = datetime.now(LOCAL_TZ)
-    rows = []
-    try:
-        with open(CSV_FILE, 'r', encoding='utf-8') as f:
-            reader = csv.reader(f)
-            headers = next(reader, None)
-            if headers is None:
-                return
-            for row in reader:
-                try:
-                    entry_time = datetime.strptime(row[4], "%H:%M:%S").replace(tzinfo=LOCAL_TZ)
-                    entry_time = entry_time.replace(year=now.year, month=now.month, day=now.day)
-                    if (now - entry_time).total_seconds() / 60 <= DELETE_AFTER_MINUTES:
-                        rows.append(row)
-                    else:
-                        send_telegram_message(f"Завершена сделка по {row[0]} ({row[1]}) в {row[4]}")
-                except:
-                    continue
-        with open(CSV_FILE, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.writer(f)
-            writer.writerow(["Symbol", "Signal", "RSI", "Entry Time", "Exit Time", "Entry Price", "Exit Price", "Breakeven_Probability"])
-            writer.writerows(rows)
-    except Exception as e:
-        print(f"Ошибка очистки сигналов: {e}")
+async def run_analysis(context: ContextTypes.DEFAULT_TYPE):
+    print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Запуск автоматического анализа")
+    expiration = context.bot_data.get('expiration', 1)  # Получаем текущую экспирацию
+    for symbol in SYMBOLS:
+        print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Анализ {symbol} на таймфрейме {DEFAULT_TIMEFRAME} с экспирацией {expiration} мин")
+        try:
+            df = get_data(symbol, interval=DEFAULT_TIMEFRAME, period="1d")
+            if df is None:
+                print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Не удалось получить данные для {symbol} ({DEFAULT_TIMEFRAME})")
+                continue
+            df_15m = get_data(symbol, interval="15m", period="3d")
+            df_1h = get_data(symbol, interval="60m", period="7d")
+            signal, rsi, strength, price, atr_v, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val, success_probability = analyze(symbol, df, df_15m, df_1h, expiration)
+            if signal != "WAIT":
+                print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] {symbol}: Потенциальный сигнал {signal}, сила={strength}, причина={reason}")
+            if signal != "WAIT" and strength >= 4:
+                msg = (
+                    f"🚨 СИГНАЛ по {symbol.replace('=X','')}\n"
+                    f"📈 Прогноз: {signal}\n"
+                    f"📊 RSI: {rsi}\n"
+                    f"💪 Сила сигнала: {strength}/9\n"
+                    f"📝 Причина: {reason}\n"
+                    f"💵 Цена: {price:.4f}\n"
+                    f"⏱ Таймфрейм: {DEFAULT_TIMEFRAME}\n"
+                    f"⏰ Прогноз на {expiration} мин\n"
+                    f"🎯 Вероятность: {success_probability:.2%}"
+                )
+                log_result(symbol.replace('=X',''), signal, rsi, datetime.now(LOCAL_TZ).strftime("%H:%M:%S"), reason, rsi_v, adx_v, stoch_v, macd_val, signal_val, atr_v, price, 0.0, success_probability)
+                send_telegram_message(msg)
+        except Exception as e:
+            print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Ошибка анализа {symbol} ({DEFAULT_TIMEFRAME}): {e}")
 
-def calculate_win_rate():
-    expected_columns = ["Symbol", "Signal", "RSI", "Entry Time", "Logged At", "Reason", "Outcome", "RSI_Value", "ADX_Value", "Stochastic_Value", "MACD_Value", "Signal_Value", "ATR_Value", "Entry_Price", "Exit_Price", "Breakeven_Probability"]
+def get_main_menu():
+    keyboard = [
+        [InlineKeyboardButton("Выбрать торговую пару", callback_data='select_pair')],
+        [InlineKeyboardButton("Выбрать экспирацию", callback_data='select_expiration')],
+        [InlineKeyboardButton("Получить сигнал", callback_data='get_signal')],
+        [InlineKeyboardButton("Обновить данные", callback_data='refresh_data')]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def get_pair_menu():
+    keyboard = [[InlineKeyboardButton(symbol.replace('=X', ''), callback_data=f'pair_{symbol}')] for symbol in SYMBOLS]
+    keyboard.append([InlineKeyboardButton("Назад", callback_data='back_to_main')])
+    return InlineKeyboardMarkup(keyboard)
+
+def get_expiration_menu():
+    expirations = [1, 2, 5]
+    keyboard = [[InlineKeyboardButton(f"{exp} мин", callback_data=f'expiration_{exp}')] for exp in expirations]
+    keyboard.append([InlineKeyboardButton("Назад", callback_data='back_to_main')])
+    return InlineKeyboardMarkup(keyboard)
+
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    chat_id = query.message.chat_id
+    data = query.data
+    print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Получен callback от chat_id={chat_id}, data={data}")
+
     for attempt in range(3):
         try:
-            if os.path.exists(RESULT_LOG_FILE):
-                df = pd.read_csv(RESULT_LOG_FILE, on_bad_lines='skip')
-                if not all(col in df.columns for col in expected_columns):
-                    print(f"Ошибка: Неверная структура results_log.csv. Ожидаемые столбцы: {expected_columns}")
-                    send_telegram_message(f"⚠️ Ошибка: Неверная структура results_log.csv. Создается новый файл.")
-                    if os.path.exists(RESULT_LOG_FILE):
-                        os.remove(RESULT_LOG_FILE)
-                    with open(RESULT_LOG_FILE, 'w', newline='', encoding='utf-8') as f:
-                        csv.writer(f).writerow(expected_columns)
-                    return 0
-                total = len(df[df['Signal'] != "WAIT"])
-                wins = len(df[(df['Signal'] != "WAIT") & (df['Outcome'] == 'WIN')])
-                win_rate = (wins / total * 100) if total > 0 else 0
-                print(f"Общий Win Rate: {win_rate:.2f}% ({wins}/{total})")
-                for symbol in SYMBOLS:
-                    sym = symbol.replace('=X', '')
-                    sym_df = df[df['Symbol'] == sym]
-                    sym_total = len(sym_df[sym_df['Signal'] != "WAIT"])
-                    sym_wins = len(sym_df[(sym_df['Signal'] != "WAIT") & (sym_df['Outcome'] == 'WIN')])
-                    sym_win_rate = (sym_wins / sym_total * 100) if sym_total > 0 else 0
-                    print(f"Win Rate для {sym}: {sym_win_rate:.2f}% ({sym_wins}/{sym_total})")
-                return win_rate
-            else:
-                print(f"Файл {RESULT_LOG_FILE} не существует. Создается новый.")
-                with open(RESULT_LOG_FILE, 'w', newline='', encoding='utf-8') as f:
-                    csv.writer(f).writerow(expected_columns)
-                return 0
+            if data == 'select_pair':
+                await query.message.edit_text("Выберите торговую пару:", reply_markup=get_pair_menu())
+                return
+            elif data == 'select_expiration':
+                await query.message.edit_text("Выберите экспирацию:", reply_markup=get_expiration_menu())
+                return
+            elif data.startswith('pair_'):
+                symbol = data.split('_')[1]
+                user_selections[chat_id] = user_selections.get(chat_id, {})
+                user_selections[chat_id]['symbol'] = symbol
+                await query.message.edit_text(f"Выбрана пара: {symbol.replace('=X', '')}\nВыберите действие:", reply_markup=get_main_menu())
+                return
+            elif data.startswith('expiration_'):
+                expiration = int(data.split('_')[1])
+                user_selections[chat_id] = user_selections.get(chat_id, {})
+                user_selections[chat_id]['expiration'] = expiration
+                context.bot_data['expiration'] = expiration
+                await query.message.edit_text(f"Выбрана экспирация: {expiration} мин\nВыберите действие:", reply_markup=get_main_menu())
+                return
+            elif data == 'get_signal':
+                if chat_id not in user_selections or 'symbol' not in user_selections[chat_id] or 'expiration' not in user_selections[chat_id]:
+                    await query.message.edit_text("Пожалуйста, выберите торговую пару и экспирацию.", reply_markup=get_main_menu())
+                    return
+                symbol = user_selections[chat_id]['symbol']
+                expiration = user_selections[chat_id]['expiration']
+                print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Запрос сигнала для {symbol} ({DEFAULT_TIMEFRAME}) с экспирацией {expiration} мин")
+                df = get_data(symbol, interval=DEFAULT_TIMEFRAME, period="1d")
+                if df is None:
+                    await query.message.edit_text(f"Ошибка получения данных для {symbol.replace('=X', '')} ({DEFAULT_TIMEFRAME}). Попробуйте позже.")
+                    return
+                df_15m = get_data(symbol, interval="15m", period="3d")
+                df_1h = get_data(symbol, interval="60m", period="7d")
+                signal, rsi, strength, price, atr_v, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val, success_probability = analyze(symbol, df, df_15m, df_1h, expiration)
+                if signal != "WAIT":
+                    print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] {symbol}: Потенциальный сигнал {signal}, сила={strength}, причина={reason}")
+                if signal != "WAIT" and strength >= 3:
+                    msg = (
+                        f"🚨 СИГНАЛ по {symbol.replace('=X','')}\n"
+                        f"📈 Прогноз: {signal}\n"
+                        f"📊 RSI: {rsi}\n"
+                        f"💪 Сила сигнала: {strength}/9\n"
+                        f"📝 Причина: {reason}\n"
+                        f"💵 Цена: {price:.4f}\n"
+                        f"⏱ Таймфрейм: {DEFAULT_TIMEFRAME}\n"
+                        f"⏰ Прогноз на {expiration} мин\n"
+                        f"🎯 Вероятность: {success_probability:.2%}"
+                    )
+                    log_result(symbol.replace('=X',''), signal, rsi, datetime.now(LOCAL_TZ).strftime("%H:%M:%S"), reason, rsi_v, adx_v, stoch_v, macd_val, signal_val, atr_v, price, 0.0, success_probability)
+                    send_telegram_message(msg)
+                else:
+                    msg = f"⚠️ Сигнал для {symbol.replace('=X','')} ({DEFAULT_TIMEFRAME}): {signal}\nПричина: {reason}"
+                await query.message.edit_text(msg, reply_markup=get_main_menu())
+                return
+            elif data == 'refresh_data':
+                data_cache.clear()
+                print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Кэш данных очищен")
+                await query.message.edit_text("Данные обновлены.", reply_markup=get_main_menu())
+                return
+            elif data == 'back_to_main':
+                await query.message.edit_text("Выберите действие:", reply_markup=get_main_menu())
+                return
+        except TimedOut as e:
+            print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Тайм-аут в button_callback (попытка {attempt+1}): {e}")
+            if attempt < 2:
+                time.sleep(5 * (2 ** attempt))
+            continue
         except Exception as e:
-            print(f"Ошибка расчета Win Rate (попытка {attempt+1}): {e}")
-            time.sleep(1)
-    send_telegram_message(f"⚠️ Ошибка расчета Win Rate: {str(e)}")
-    return 0
+            print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Ошибка в button_callback (попытка {attempt+1}): {e}")
+            if attempt < 2:
+                time.sleep(5 * (2 ** attempt))
+            continue
+    print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Не удалось обработать callback {data} после 3 попыток")
+    send_telegram_message(f"Ошибка: не удалось обработать действие {data}. Проверьте соединение.")
 
-def can_generate_signal(symbol):
-    global last_signal_time
-    now = datetime.now()
-    if last_signal_time[symbol] is None or (now - last_signal_time[symbol]).total_seconds() > MIN_SIGNAL_INTERVAL:
-        last_signal_time[symbol] = now
-        return True
-    return False
-
-def send_signal(symbol, signal, rsi, price, atr_v, df_5m, df_1h, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val, signal_strength):
+def log_result(symbol, signal, rsi, entry_time, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val, atr_v, entry_price, exit_price, success_probability, outcome="PENDING"):
+    expected_columns = ["Symbol", "Signal", "RSI", "Entry Time", "Logged At", "Reason", "Outcome", "RSI_Value", "ADX_Value", "Stochastic_Value", "MACD_Value", "Signal_Value", "ATR_Value", "Entry_Price", "Exit_Price", "Success_Probability"]
     try:
-        now = datetime.now(LOCAL_TZ)
-        TRADE_DURATION_MINUTES = 1  # Фиксированная экспирация 1 минута
-        entry = now + timedelta(seconds=PREPARE_SECONDS)
-        exit_ = entry + timedelta(minutes=TRADE_DURATION_MINUTES)
-        entry_str = entry.strftime("%H:%M:%S")
-        exit_str = exit_.strftime("%H:%M:%S")
-        stop_loss = price - 1.5 * atr_v if "BUY" in signal else price + 1.5 * atr_v  # Динамический SL
-        take_profit = price + 3 * atr_v if "BUY" in signal else price - 3 * atr_v  # Динамический TP
-        entry_price = price
-        exit_price = 0.0  # Будет обновлено после экспирации
-
-        # Рассчитываем вероятность перекрытия
-        breakeven_probability = calculate_breakeven_probability(df_5m, df_1h, atr_v, price, signal, TRADE_DURATION_MINUTES)
-
-        # Определяем тренд H1 для сообщения
-        trend = "NEUTRAL"
-        if df_1h is not None:
-            ema12_h1 = EMAIndicator(df_1h['close'], window=12).ema_indicator().iloc[-1]
-            ema26_h1 = EMAIndicator(df_1h['close'], window=26).ema_indicator().iloc[-1]
-            trend = "BULLISH" if ema12_h1 > ema26_h1 else "BEARISH" if ema12_h1 < ema26_h1 else "NEUTRAL"
-
-        # Предупреждение при низкой вероятности
-        warning = "⚠️ Низкая вероятность перекрытия! Будьте осторожны." if breakeven_probability < 50 else ""
-
-        msg = (
-            f"🚨 СИГНАЛ по {symbol.replace('=X','')}\n"
-            f"📈 Прогноз: {signal}\n"
-            f"📊 RSI: {rsi}\n"
-            f"💪 Сила сигнала: {signal_strength}/8\n"
-            f"📝 Причина: {reason}\n"
-            f"📅 Тренд H1: {trend}\n"
-            f"⏱ Вход: {entry_str} (через {PREPARE_SECONDS} сек)\n"
-            f"⏳ Выход: {exit_str} (через {TRADE_DURATION_MINUTES} мин после входа)\n"
-            f"🛑 Stop Loss: {stop_loss:.4f}\n"
-            f"🎯 Take Profit: {take_profit:.4f}\n"
-            f"💵 Цена входа: {entry_price:.4f}\n"
-            f"📉 Вероятность перекрытия убытка: {breakeven_probability}%\n"
-            f"{warning}"
-        )
-
-        print(msg)
-        if send_telegram_message(msg):
-            log_signal(symbol.replace('=X',''), signal, rsi, entry_str, exit_str, entry_price, exit_price, breakeven_probability)
-            log_result(symbol.replace('=X',''), signal, rsi, entry_str, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val, atr_v, entry_price, exit_price, breakeven_probability=breakeven_probability)
-            schedule(symbol.replace('=X',''), signal, rsi, entry)
+        with open(RESULT_LOG_FILE, 'a', newline='', encoding='utf-8') as f:
+            csv.writer(f).writerow([symbol, signal, rsi, entry_time, datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"), reason, outcome, rsi_v, adx_v, stoch_v, macd_val, signal_val, atr_v, entry_price, exit_price, success_probability])
+        print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Результат записан в лог: {symbol}, {signal}")
     except Exception as e:
-        print(f"❌ Ошибка в send_signal для {symbol}: {e}")
-        send_telegram_message(f"❌ Ошибка отправки сигнала для {symbol.replace('=X','')}: {str(e)}")
+        print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Ошибка записи в лог результатов: {e}")
 
 def main():
-    if not os.path.exists(CSV_FILE):
-        with open(CSV_FILE, 'w', newline='', encoding='utf-8') as f:
-            csv.writer(f).writerow(["Symbol", "Signal", "RSI", "Entry Time", "Exit Time", "Entry Price", "Exit Price", "Breakeven_Probability"])
-    if not os.path.exists(RESULT_LOG_FILE):
-        with open(RESULT_LOG_FILE, 'w', newline='', encoding='utf-8') as f:
-            csv.writer(f).writerow(["Symbol", "Signal", "RSI", "Entry Time", "Logged At", "Reason", "Outcome", "RSI_Value", "ADX_Value", "Stochastic_Value", "MACD_Value", "Signal_Value", "ATR_Value", "Entry_Price", "Exit_Price", "Breakeven_Probability"])
-
-    while True:
-        print("🌀 Новый цикл анализа...")
-        clean_old_signals()
-        signals = []
-        for symbol in SYMBOLS:
-            df_5m = get_data(symbol, interval="5m", period="7d")
-            time.sleep(2)
-            df_15m = get_data(symbol, interval="15m", period="10d")
-            time.sleep(2)
-            df_1h = get_data(symbol, interval="60m", period="30d")
-            time.sleep(2)
-            if df_5m is not None and can_generate_signal(symbol):
-                signal, rsi, strength, price, atr_v, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val = analyze(symbol, df_5m, df_15m, df_1h)
-                print(f"[{symbol}] Сигнал: {signal}, Сила: {strength}, Причина: {reason}")
-                if signal != "WAIT" and strength >= 3:
-                    signals.append((symbol, signal, rsi, price, atr_v, df_5m, df_1h, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val, strength))
-                else:
-                    print(f"[{symbol}] Сигнал не сгенерирован: {reason}")
-            else:
-                print(f"[{symbol}] Пропуск анализа: отсутствуют данные 5m")
-        if not signals:
-            send_telegram_message("⚠️ Сигналы не сгенерированы в текущем цикле")
-        for sig in signals:
-            send_signal(*sig)
-        calculate_win_rate()
-        print("⏳ Ожидание...")
-        time.sleep(INTERVAL)
+    try:
+        print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Бот запускается...")
+        if not os.path.exists(RESULT_LOG_FILE):
+            with open(RESULT_LOG_FILE, 'w', newline='', encoding='utf-8') as f:
+                csv.writer(f).writerow(["Symbol", "Signal", "RSI", "Entry Time", "Logged At", "Reason", "Outcome", "RSI_Value", "ADX_Value", "Stochastic_Value", "MACD_Value", "Signal_Value", "ATR_Value", "Entry_Price", "Exit_Price", "Success_Probability"])
+        application = Application.builder().token(TELEGRAM_TOKEN).build()
+        application.job_queue.scheduler.configure(timezone=LOCAL_TZ)
+        application.add_handler(CommandHandler("start", start))
+        application.add_handler(CallbackQueryHandler(button_callback))
+        application.job_queue.run_repeating(run_analysis, interval=300, first=10)
+        send_telegram_message("Бот успешно запущен и начал анализ рынка!")
+        print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Бот запущен, ожидает команды...")
+        application.run_polling()
+    except Exception as e:
+        print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Ошибка при запуске бота: {e}")
 
 if __name__ == '__main__':
     main()
-
