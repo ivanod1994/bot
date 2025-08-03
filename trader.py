@@ -421,7 +421,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for attempt in range(3):
         try:
             await update.message.reply_text(
-                "Добро пожаловать в торгового бота! Прогнозы с выбранной экспирацией. Используйте кнопки ниже для выбора пары и экспирации.",
+                "Добро пожаловать в торгового бота! Прогнозы с выбранной экспирацией. Используйте кнопки ниже для выбора пары, экспирации или силы сигнала для автоанализа.",
                 reply_markup=get_main_menu()
             )
             return
@@ -441,6 +441,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def run_analysis(context: ContextTypes.DEFAULT_TYPE):
     print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Запуск автоматического анализа")
     expiration = 1  # Фиксированная экспирация 1 минута для автоматического анализа
+    min_signal_strength = context.bot_data.get('auto_signal_strength', 4)  # Получаем минимальную силу сигнала (по умолчанию 4)
+    print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Минимальная сила сигнала для автоанализа: {min_signal_strength}")
     for symbol in SYMBOLS:
         print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Анализ {symbol} на таймфрейме {DEFAULT_TIMEFRAME} с экспирацией 1 мин")
         try:
@@ -453,7 +455,7 @@ async def run_analysis(context: ContextTypes.DEFAULT_TYPE):
             signal, rsi, strength, price, atr_v, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val, success_probability = analyze(symbol, df, df_15m, df_1h, expiration)
             if signal != "WAIT":
                 print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] {symbol}: Потенциальный сигнал {signal}, сила={strength}, причина={reason}")
-            if signal != "WAIT" and strength >= 4:
+            if signal != "WAIT" and strength >= min_signal_strength:
                 msg = (
                     f"🚨 СИГНАЛ по {symbol.replace('=X','')}\n"
                     f"📈 Прогноз: {signal}\n"
@@ -474,6 +476,7 @@ def get_main_menu():
     keyboard = [
         [InlineKeyboardButton("Выбрать торговую пару", callback_data='select_pair')],
         [InlineKeyboardButton("Выбрать экспирацию", callback_data='select_expiration')],
+        [InlineKeyboardButton("Выбрать силу сигнала для автоанализа", callback_data='select_signal_strength')],
         [InlineKeyboardButton("Получить сигнал", callback_data='get_signal')],
         [InlineKeyboardButton("Обновить данные", callback_data='refresh_data')]
     ]
@@ -487,6 +490,12 @@ def get_pair_menu():
 def get_expiration_menu():
     expirations = [1, 2, 5]
     keyboard = [[InlineKeyboardButton(f"{exp} мин", callback_data=f'expiration_{exp}')] for exp in expirations]
+    keyboard.append([InlineKeyboardButton("Назад", callback_data='back_to_main')])
+    return InlineKeyboardMarkup(keyboard)
+
+def get_signal_strength_menu():
+    strengths = [3, 4, 5]
+    keyboard = [[InlineKeyboardButton(f"Сила {strength}/9", callback_data=f'signal_strength_{strength}')] for strength in strengths]
     keyboard.append([InlineKeyboardButton("Назад", callback_data='back_to_main')])
     return InlineKeyboardMarkup(keyboard)
 
@@ -505,6 +514,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             elif data == 'select_expiration':
                 await query.message.edit_text("Выберите экспирацию:", reply_markup=get_expiration_menu())
                 return
+            elif data == 'select_signal_strength':
+                await query.message.edit_text("Выберите минимальную силу сигнала для автоанализа:", reply_markup=get_signal_strength_menu())
+                return
             elif data.startswith('pair_'):
                 symbol = data.split('_')[1]
                 user_selections[chat_id] = user_selections.get(chat_id, {})
@@ -517,6 +529,11 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 user_selections[chat_id]['expiration'] = expiration
                 context.bot_data['expiration'] = expiration
                 await query.message.edit_text(f"Выбрана экспирация: {expiration} мин\nВыберите действие:", reply_markup=get_main_menu())
+                return
+            elif data.startswith('signal_strength_'):
+                strength = int(data.split('_')[2])
+                context.bot_data['auto_signal_strength'] = strength
+                await query.message.edit_text(f"Выбрана минимальная сила сигнала для автоанализа: {strength}/9\nВыберите действие:", reply_markup=get_main_menu())
                 return
             elif data == 'get_signal':
                 if chat_id not in user_selections or 'symbol' not in user_selections[chat_id] or 'expiration' not in user_selections[chat_id]:
