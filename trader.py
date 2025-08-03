@@ -1,96 +1,134 @@
-import os
-import time
 import requests
 import pandas as pd
 import numpy as np
-from datetime import datetime, timezone
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
+import time
+import csv
+import os
 from ta.momentum import RSIIndicator, StochasticOscillator
 from ta.trend import MACD, EMAIndicator, ADXIndicator
 from ta.volatility import BollingerBands, AverageTrueRange
-from bs4 import BeautifulSoup
+from datetime import datetime, timedelta, timezone
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import pytz
-import yfinance as yf
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+from telegram.error import TimedOut
+try:
+    from bs4 import BeautifulSoup
+    BEAUTIFULSOUP_AVAILABLE = True
+except ImportError:
+    BEAUTIFULSOUP_AVAILABLE = False
+    print("Библиотека BeautifulSoup не установлена. Установите: pip install beautifulsoup4")
+try:
+    from alpha_vantage.foreignexchange import ForeignExchange
+    ALPHA_VANTAGE_AVAILABLE = True
+except ImportError:
+    ALPHA_VANTAGE_AVAILABLE = False
+    print("Библиотека alpha_vantage не установлена. Установите: pip install alpha-vantage")
 
-# Настройки
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8246979603:AAGSP7b-YRol151GlZpfxyyS34rW5ncZJo4")
-CHAT_ID = os.getenv("CHAT_ID", "6677680988")
-MANUAL_TZ = os.getenv("MANUAL_TZ", "Africa/Algiers")
-LOCAL_TZ = pytz.timezone(MANUAL_TZ)
+# === НАСТРОЙКИ ===
+TELEGRAM_TOKEN = "8246979603:AAGSP7b-YRol151GlZpfxyyS34rW5ncZJo4"
+CHAT_ID = "6677680988"
+SYMBOLS = ["EURJPY=X", "EURUSD=X", "CHFJPY=X", "USDCAD=X", "CADJPY=X", "GBPUSD=X", "AUDUSD=X"]
+SYMBOLS_ALPHA = ["EUR/JPY", "EUR/USD", "CHF/JPY", "USD/CAD", "CAD/JPY", "GBP/USD", "AUD/USD"]
 DEFAULT_TIMEFRAME = "5m"
-CONFIRMATION_CANDLES = 2
+CSV_FILE = "signals.csv"
+DELETE_AFTER_MINUTES = 5
+PREPARE_SECONDS = 90
 RESULT_LOG_FILE = "results_log.csv"
+MANUAL_TZ = "Africa/Algiers"
+CONFIRMATION_CANDLES = 2
+PAYOUT = 0.85
 TIMEOUT = 30
-data_cache = {}
+MIN_SIGNAL_INTERVAL = 60
+VOLUME_MULTIPLIER = float('inf')
+ALPHA_VANTAGE_API_KEY = "YOUR_ALPHA_VANTAGE_API_KEY"
+HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"}
+# =================
 
-def get_data(symbol, interval=DEFAULT_TIMEFRAME, period="1d"):
-    cache_key = f"{symbol}_{interval}"
-    if cache_key in data_cache and (datetime.now() - data_cache[cache_key]['time']).seconds < 300:
-        print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Использую кэшированные данные для {symbol} ({interval})")
-        return data_cache[cache_key]['data']
-    
-    print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Загружаю данные для {symbol} ({interval})")
-    for attempt in range(3):
-        try:
-            df = yf.download(symbol, interval=interval, period=period, progress=False)
-            if df.empty:
-                raise ValueError(f"Данные для {symbol} ({interval}) пусты")
-            df['datetime'] = df.index
-            df['datetime'] = df['datetime'].dt.tz_localize(None)
-            data_cache[cache_key] = {'data': df, 'time': datetime.now()}
-            print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Данные для {symbol} ({interval}) успешно загружены")
-            return df
-        except Exception as e:
-            print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] [{symbol}] Ошибка Yahoo Finance (попытка {attempt+1}): {str(e)}")
-            time.sleep(15 ** attempt)
-    print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] [{symbol}] Не удалось загрузить данные после 3 попыток")
-    return pd.DataFrame()
+data_cache = {}
+last_signal_time = {symbol: None for symbol in SYMBOLS}
+user_selections = {}
+
+def get_timezone():
+    try:
+        if MANUAL_TZ:
+            return pytz.timezone(MANUAL_TZ)
+        response = requests.get("https://ipinfo.io/json", timeout=5)
+        response.raise_for_status()
+        data = response.json()
+        timezone_str = data.get("timezone", "UTC")
+        return pytz.timezone(timezone_str)
+    except Exception as e:
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] Ошибка определения часового пояса: {e}")
+        return pytz.timezone("UTC")
+
+LOCAL_TZ = get_timezone()
+
+session = requests.Session()
+retry = Retry(total=5, backoff_factor=2, status_forcelist=[429, 502, 503, 504])
+session.mount('https://', HTTPAdapter(max_retries=retry))
 
 def is_active_session():
     now = datetime.now(LOCAL_TZ)
     hour = now.hour
-    return not (hour < 8 or hour >= 22)
+    return 8 <= hour <= 22
 
 def is_news_time():
+    if not BEAUTIFULSOUP_AVAILABLE:
+        print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] BeautifulSoup недоступен, пропускаем проверку новостей")
+        return False
     try:
-        response = requests.get("https://www.forexfactory.com/calendar", timeout=10)
+        url = "https://www.investing.com/economic-calendar/"
+        response = session.get(url, headers=HEADERS, timeout=TIMEOUT)
         soup = BeautifulSoup(response.text, 'html.parser')
-        events = soup.find_all('tr', class_='calendar_row')
+        events = soup.find_all('tr', {'data-event-id': True})
+        now = datetime.now(LOCAL_TZ)
         for event in events:
-            time_elem = event.find('td', class_='calendar__time')
-            impact_elem = event.find('td', class_='calendar__impact')
-            if time_elem and impact_elem and 'High' in impact_elem.text:
+            time_elem = event.find('td', class_='time')
+            if not time_elem:
+                continue
+            time_str = time_elem.text.strip()
+            try:
+                event_time = datetime.strptime(time_str, "%H:%M").replace(
+                    year=now.year, month=now.month, day=now.day, tzinfo=LOCAL_TZ
+                )
+                if abs((now - event_time).total_seconds()) < 1800:
+                    print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Обнаружены новости, торговля приостановлена")
+                    return True
+            except ValueError:
+                continue
+        return False
+    except Exception as e:
+        print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Ошибка проверки новостей: {e}")
+        return False
+
+def check_internet():
+    try:
+        requests.get("https://www.google.com", timeout=5)
+        return True
+    except Exception as e:
+        print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Нет интернета: {e}")
+        return False
+
+def send_telegram_message(msg):
+    if not check_internet():
+        print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Нет интернета для отправки Telegram")
+        return False
+    for attempt in range(3):
+        try:
+            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+            response = requests.post(url, data={"chat_id": CHAT_ID, "text": msg}, timeout=TIMEOUT)
+            if response.status_code != 200:
+                print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Ошибка Telegram (попытка {attempt+1}): {response.json().get('description', 'Нет деталей')}")
+            else:
+                print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Telegram сообщение отправлено: {msg[:50]}...")
                 return True
-        return False
-    except Exception as e:
-        print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Ошибка проверки новостей: {str(e)}")
-        return False
-
-def log_result(symbol, signal, rsi, entry_time, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val, atr_v, entry_price, exit_price, success_probability, outcome="PENDING"):
-    try:
-        entry_time_str = entry_time.strftime("%Y-%m-%d %H:%M:%S") if isinstance(entry_time, datetime) else entry_time
-        logged_at = datetime.now(LOCAL_TZ).strftime("%Y-%m-%d %H:%M:%S")
-        data = {
-            'Symbol': symbol, 'Signal': signal, 'RSI': rsi, 'Entry Time': entry_time_str, 'Logged At': logged_at,
-            'Reason': reason, 'Outcome': outcome, 'RSI_Value': rsi_v, 'ADX_Value': adx_v, 'Stoch_Value': stoch_v,
-            'MACD_Value': macd_val, 'Signal_Value': signal_val, 'ATR_Value': atr_v, 'Entry_Price': entry_price,
-            'Exit_Price': exit_price, 'Success_Probability': success_probability
-        }
-        df = pd.DataFrame([data])
-        df.to_csv(RESULT_LOG_FILE, mode='a', header=not os.path.exists(RESULT_LOG_FILE), index=False)
-        print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Результат записан в лог: {symbol}, {signal}")
-    except Exception as e:
-        print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Ошибка записи в лог: {str(e)}")
-
-async def send_telegram_message(message):
-    try:
-        async with Application.builder().token(TELEGRAM_TOKEN).build() as app:
-            await app.bot.send_message(chat_id=CHAT_ID, text=message, parse_mode="Markdown")
-            print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Telegram сообщение отправлено: {message[:50]}...")
-    except Exception as e:
-        print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Ошибка Telegram: {str(e)}")
+            time.sleep(2 ** attempt)
+        except Exception as e:
+            print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Ошибка Telegram (попытка {attempt+1}): {e}")
+    return False
 
 def detect_fractals(df, window=2):
     """
@@ -105,20 +143,93 @@ def detect_fractals(df, window=2):
     
     for i in range(window, len(df) - window):
         # Бычий фрактал: минимум текущей свечи ниже минимумов двух предыдущих и двух последующих свечей
-        if (df['Low'].iloc[i] < df['Low'].iloc[i-1] and
-            df['Low'].iloc[i] < df['Low'].iloc[i-2] and
-            df['Low'].iloc[i] < df['Low'].iloc[i+1] and
-            df['Low'].iloc[i] < df['Low'].iloc[i+2]):
+        if (df['low'].iloc[i] < df['low'].iloc[i-1] and
+            df['low'].iloc[i] < df['low'].iloc[i-2] and
+            df['low'].iloc[i] < df['low'].iloc[i+1] and
+            df['low'].iloc[i] < df['low'].iloc[i+2]):
             bullish_fractals.iloc[i] = True
         
         # Медвежий фрактал: максимум текущей свечи выше максимумов двух предыдущих и двух последующих свечей
-        if (df['High'].iloc[i] > df['High'].iloc[i-1] and
-            df['High'].iloc[i] > df['High'].iloc[i-2] and
-            df['High'].iloc[i] > df['High'].iloc[i+1] and
-            df['High'].iloc[i] > df['High'].iloc[i+2]):
+        if (df['high'].iloc[i] > df['high'].iloc[i-1] and
+            df['high'].iloc[i] > df['high'].iloc[i-2] and
+            df['high'].iloc[i] > df['high'].iloc[i+1] and
+            df['high'].iloc[i] > df['high'].iloc[i+2]):
             bearish_fractals.iloc[i] = True
     
     return bullish_fractals, bearish_fractals
+
+def get_data(symbol, interval=DEFAULT_TIMEFRAME, period="1d"):
+    cache_key = f"{symbol}_{interval}"
+    if cache_key in data_cache and (datetime.now() - data_cache[cache_key]['time']).seconds < 300:
+        print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Использую кэшированные данные для {symbol} ({interval})")
+        return data_cache[cache_key]['data']
+    
+    print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Загружаю данные для {symbol} ({interval})")
+    for attempt in range(3):
+        try:
+            url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?range={period}&interval={interval}"
+            response = session.get(url, headers=HEADERS, timeout=TIMEOUT)
+            if response.status_code == 429:
+                print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Ошибка 429, жду перед повтором (попытка {attempt+1})")
+                time.sleep(15 ** attempt)
+                continue
+            data = response.json()
+            if data['chart']['result'] is None:
+                print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Нет данных от Yahoo Finance для {symbol}")
+                continue
+            result = data['chart']['result'][0]
+            ts = result['timestamp']
+            quote = result['indicators']['quote'][0]
+            df = pd.DataFrame({
+                "timestamp": [datetime.fromtimestamp(t, tz=LOCAL_TZ).strftime("%Y-%m-%d %H:%M:%S") for t in ts],
+                "close": quote['close'],
+                "high": quote['high'],
+                "low": quote['low'],
+                "open": quote['open'],
+                "volume": quote['volume']
+            })
+            df.dropna(inplace=True)
+            if len(df) < 50:
+                print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Недостаточно данных для {symbol} ({len(df)} свечей)")
+                continue
+            data_cache[cache_key] = {'data': df, 'time': datetime.now()}
+            print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Данные для {symbol} ({interval}) успешно загружены")
+            return df
+        except Exception as e:
+            print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] [{symbol}] Ошибка Yahoo Finance (попытка {attempt+1}): {str(e)}")
+            time.sleep(15 ** attempt)
+    
+    if ALPHA_VANTAGE_AVAILABLE and ALPHA_VANTAGE_API_KEY != "YOUR_ALPHA_VANTAGE_API_KEY":
+        print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Пробую Alpha Vantage для {symbol} ({interval})")
+        for attempt in range(3):
+            try:
+                alpha_symbol = SYMBOLS_ALPHA[SYMBOLS.index(symbol)]
+                fx = ForeignExchange(key=ALPHA_VANTAGE_API_KEY)
+                data, _ = fx.get_currency_exchange_intraday(symbol=alpha_symbol, interval=interval, outputsize="full")
+                if not data:
+                    print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Нет данных от Alpha Vantage для {symbol}")
+                    continue
+                df = pd.DataFrame(data).transpose().reset_index()
+                df.columns = ['timestamp', 'open', 'high', 'low', 'close']
+                df['open'] = df['open'].astype(float)
+                df['high'] = df['high'].astype(float)
+                df['low'] = df['low'].astype(float)
+                df['close'] = df['close'].astype(float)
+                df['volume'] = 0
+                df['timestamp'] = pd.to_datetime(df['timestamp']).dt.astimezone(LOCAL_TZ).dt.strftime("%Y-%m-%d %H:%M:%S")
+                df = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
+                df.dropna(inplace=True)
+                if len(df) < 50:
+                    print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Недостаточно данных от Alpha Vantage для {symbol} ({len(df)} свечей)")
+                    continue
+                data_cache[cache_key] = {'data': df, 'time': datetime.now()}
+                print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Данные от Alpha Vantage для {symbol} ({interval}) успешно загружены")
+                return df
+            except Exception as e:
+                print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] [{symbol}] Ошибка Alpha Vantage (попытка {attempt+1}): {str(e)}")
+                time.sleep(15 ** attempt)
+    print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Не удалось загрузить данные для {symbol} ({interval})")
+    return None
 
 def analyze(symbol, df_5m, df_15m=None, df_1h=None, expiration=1):
     print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Анализирую {symbol} для прогноза с экспирацией {expiration} мин...")
@@ -127,10 +238,10 @@ def analyze(symbol, df_5m, df_15m=None, df_1h=None, expiration=1):
         print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] {symbol}: {reason}")
         return "WAIT", 0, 0, 0, 0, reason, 0, 0, 0, 0, 0, 0
     
-    close = df_5m['Close']
-    high = df_5m['High']
-    low = df_5m['Low']
-    open = df_5m['Open']
+    close = df_5m['close']
+    high = df_5m['high']
+    low = df_5m['low']
+    open = df_5m['open']
     
     rsi = RSIIndicator(close, window=14).rsi()
     macd = MACD(close, window_slow=26, window_fast=12, window_sign=9)
@@ -163,10 +274,10 @@ def analyze(symbol, df_5m, df_15m=None, df_1h=None, expiration=1):
 
     # Прогноз движения цены на основе ATR
     atr_mean = atr[-10:].mean()
-    expected_move = atr_mean * (expiration / 5.0)
+    expected_move = atr_mean * (expiration / 5.0)  # Масштабируем ATR на экспирацию (5m базовый таймфрейм)
     price_high = price + expected_move
     price_low = price - expected_move
-    success_probability = 0.65
+    success_probability = 0.65  # Базовая вероятность успеха (на основе исторической волатильности)
 
     rsi_mean = rsi[-10:].mean()
     rsi_std = rsi[-10:].std()
@@ -177,18 +288,19 @@ def analyze(symbol, df_5m, df_15m=None, df_1h=None, expiration=1):
 
     RSI_BUY_THRESHOLD = max(30, rsi_mean - rsi_std)
     RSI_SELL_THRESHOLD = min(70, rsi_mean + rsi_std)
-    MIN_ADX = max(20, adx_mean * 0.8)
+    MIN_ADX = max(20, adx_mean * 0.7)
     BB_WIDTH_MIN = max(0.0005, bb_width_mean * 0.5)
     MIN_ATR = atr_mean * 0.5
 
     trend = "NEUTRAL"
     if df_15m is not None:
-        ema5_m15 = EMAIndicator(df_15m['Close'], window=5).ema_indicator().iloc[-1]
-        ema12_m15 = EMAIndicator(df_15m['Close'], window=12).ema_indicator().iloc[-1]
+        ema5_m15 = EMAIndicator(df_15m['close'], window=5).ema_indicator().iloc[-1]
+        ema12_m15 = EMAIndicator(df_15m['close'], window=12).ema_indicator().iloc[-1]
         trend = "BULLISH" if ema5_m15 > ema12_m15 else "BEARISH" if ema5_m15 < ema12_m15 else "NEUTRAL"
 
     reason = (f"RSI: {rsi_v:.2f}, ADX: {adx_v:.2f}, Stochastic: {stoch_v:.2f}, MACD: {macd_val:.4f}, "
-              f"Signal: {signal_val:.4f}, ATR: {atr_v:.4f}, BB_Width: {bb_width:.4f}, Trend M15: {trend}")
+              f"Signal: {signal_val:.4f}, ATR: {atr_v:.4f}, BB_Width: {bb_width:.4f}, Trend M15: {trend}, "
+              f"Expected Move: ±{expected_move:.4f}, Success Probability: {success_probability:.2%}")
 
     if adx_v < MIN_ADX:
         reason += f"; ADX слишком низкий (< {MIN_ADX})"
@@ -249,7 +361,7 @@ def analyze(symbol, df_5m, df_15m=None, df_1h=None, expiration=1):
         reason += "Обнаружен бычий фрактал; "
 
     if signal_strength >= 3:
-        if price_high > price * 1.0005:
+        if price_high > price * 1.0005:  # Проверяем, что прогнозируемая цена выше текущей на 0.05%
             signal_strength += 1
             reason += f"Прогноз роста на {expiration} мин; "
         else:
@@ -290,7 +402,7 @@ def analyze(symbol, df_5m, df_15m=None, df_1h=None, expiration=1):
         reason += "Обнаружен медвежий фрактал; "
 
     if signal_strength >= 3:
-        if price_low < price * 0.9995:
+        if price_low < price * 0.9995:  # Проверяем, что прогнозируемая цена ниже текущей на 0.05%
             signal_strength += 1
             reason += f"Прогноз падения на {expiration} мин; "
         else:
@@ -304,135 +416,188 @@ def analyze(symbol, df_5m, df_15m=None, df_1h=None, expiration=1):
     print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] {symbol}: {reason}")
     return "WAIT", round(rsi_v, 2), 0, price, atr_v, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val, success_probability
 
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Получена команда /start от chat_id={update.message.chat_id}")
+    for attempt in range(3):
+        try:
+            await update.message.reply_text(
+                "Добро пожаловать в торгового бота! Прогнозы с выбранной экспирацией. Используйте кнопки ниже для выбора пары и экспирации.",
+                reply_markup=get_main_menu()
+            )
+            return
+        except TimedOut as e:
+            print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Тайм-аут в /start (попытка {attempt+1}): {e}")
+            if attempt < 2:
+                time.sleep(5 * (2 ** attempt))
+            continue
+        except Exception as e:
+            print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Ошибка в /start (попытка {attempt+1}): {e}")
+            if attempt < 2:
+                time.sleep(5 * (2 ** attempt))
+            continue
+    print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Не удалось отправить ответ на /start после 3 попыток")
+    send_telegram_message("Ошибка: не удалось ответить на /start. Проверьте соединение или настройки бота.")
+
 async def run_analysis(context: ContextTypes.DEFAULT_TYPE):
     print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Запуск автоматического анализа")
-    for symbol in ["EURJPY=X", "USDCAD=X", "CADJPY=X", "GBPUSD=X", "AUDUSD=X", "CHFJPY=X"]:
+    expiration = 1  # Фиксированная экспирация 1 минута для автоматического анализа
+    for symbol in SYMBOLS:
         print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Анализ {symbol} на таймфрейме {DEFAULT_TIMEFRAME} с экспирацией 1 мин")
-        df_5m = get_data(symbol, interval="5m", period="1d")
-        df_15m = get_data(symbol, interval="15m", period="1d")
-        df_1h = get_data(symbol, interval="60m", period="5d")
-        
-        expiration = 1  # Фиксированная экспирация 1 минута для автоматического анализа
-        signal, rsi, strength, price, atr, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val, success_probability = analyze(symbol, df_5m, df_15m, df_1h, expiration)
-        
-        if signal != "WAIT" and strength >= 4:
-            entry_time = datetime.now(LOCAL_TZ)
-            message = (f"🚨 *СИГНАЛ по {symbol}*\n"
-                       f"📈 *Прогноз*: {signal}\n"
-                       f"📊 *RSI*: {rsi:.2f}\n"
-                       f"💪 *Сила сигнала*: {strength}/9\n"
-                       f"📝 *Причина*: {reason}\n"
-                       f"💵 *Цена*: {price:.4f}\n"
-                       f"⏱ *Таймфрейм*: {DEFAULT_TIMEFRAME}\n"
-                       f"⏰ *Прогноз на 1 мин*\n"
-                       f"🎯 *Вероятность*: {success_probability:.2%}")
-            await send_telegram_message(message)
-            log_result(symbol, signal, rsi, entry_time, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val, atr, price, None, success_probability)
-            print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] {symbol}: Потенциальный сигнал {signal}, сила={strength}, причина={reason}")
-        else:
-            print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] {symbol}: Потенциальный сигнал {signal}, сила={strength}, причина={reason}")
+        try:
+            df = get_data(symbol, interval=DEFAULT_TIMEFRAME, period="1d")
+            if df is None:
+                print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Не удалось получить данные для {symbol} ({DEFAULT_TIMEFRAME})")
+                continue
+            df_15m = get_data(symbol, interval="15m", period="3d")
+            df_1h = get_data(symbol, interval="60m", period="7d")
+            signal, rsi, strength, price, atr_v, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val, success_probability = analyze(symbol, df, df_15m, df_1h, expiration)
+            if signal != "WAIT":
+                print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] {symbol}: Потенциальный сигнал {signal}, сила={strength}, причина={reason}")
+            if signal != "WAIT" and strength >= 4:
+                msg = (
+                    f"🚨 СИГНАЛ по {symbol.replace('=X','')}\n"
+                    f"📈 Прогноз: {signal}\n"
+                    f"📊 RSI: {rsi}\n"
+                    f"💪 Сила сигнала: {strength}/9\n"
+                    f"📝 Причина: {reason}\n"
+                    f"💵 Цена: {price:.4f}\n"
+                    f"⏱ Таймфрейм: {DEFAULT_TIMEFRAME}\n"
+                    f"⏰ Прогноз на 1 мин\n"
+                    f"🎯 Вероятность: {success_probability:.2%}"
+                )
+                log_result(symbol.replace('=X',''), signal, rsi, datetime.now(LOCAL_TZ).strftime("%H:%M:%S"), reason, rsi_v, adx_v, stoch_v, macd_val, signal_val, atr_v, price, 0.0, success_probability)
+                send_telegram_message(msg)
+        except Exception as e:
+            print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Ошибка анализа {symbol} ({DEFAULT_TIMEFRAME}): {e}")
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def get_main_menu():
     keyboard = [
         [InlineKeyboardButton("Выбрать торговую пару", callback_data='select_pair')],
         [InlineKeyboardButton("Выбрать экспирацию", callback_data='select_expiration')],
         [InlineKeyboardButton("Получить сигнал", callback_data='get_signal')],
         [InlineKeyboardButton("Обновить данные", callback_data='refresh_data')]
     ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text(
-        "Добро пожаловать в торгового бота! Прогнозы с выбранной экспирацией. Используйте кнопки ниже для выбора пары и экспирации.",
-        reply_markup=reply_markup
-    )
-    print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Получена команда /start от chat_id={update.effective_chat.id}")
+    return InlineKeyboardMarkup(keyboard)
+
+def get_pair_menu():
+    keyboard = [[InlineKeyboardButton(symbol.replace('=X', ''), callback_data=f'pair_{symbol}')] for symbol in SYMBOLS]
+    keyboard.append([InlineKeyboardButton("Назад", callback_data='back_to_main')])
+    return InlineKeyboardMarkup(keyboard)
+
+def get_expiration_menu():
+    expirations = [1, 2, 5]
+    keyboard = [[InlineKeyboardButton(f"{exp} мин", callback_data=f'expiration_{exp}')] for exp in expirations]
+    keyboard.append([InlineKeyboardButton("Назад", callback_data='back_to_main')])
+    return InlineKeyboardMarkup(keyboard)
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    chat_id = query.message.chat_id
     data = query.data
-    print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Получен callback от chat_id={query.from_user.id}, data={data}")
-    
-    if data == 'select_pair':
-        keyboard = [
-            [InlineKeyboardButton("EURJPY", callback_data='pair_EURJPY=X')],
-            [InlineKeyboardButton("USDCAD", callback_data='pair_USDCAD=X')],
-            [InlineKeyboardButton("CADJPY", callback_data='pair_CADJPY=X')],
-            [InlineKeyboardButton("GBPUSD", callback_data='pair_GBPUSD=X')],
-            [InlineKeyboardButton("AUDUSD", callback_data='pair_AUDUSD=X')],
-            [InlineKeyboardButton("CHFJPY", callback_data='pair_CHFJPY=X')]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.message.reply_text("Выберите торговую пару:", reply_markup=reply_markup)
-    
-    elif data.startswith('pair_'):
-        symbol = data.split('pair_')[1]
-        context.user_data['symbol'] = symbol
-        await query.message.reply_text(f"Выбрана пара: {symbol.replace('=X', '')}")
-    
-    elif data == 'select_expiration':
-        keyboard = [
-            [InlineKeyboardButton("1 минута", callback_data='expiration_1')],
-            [InlineKeyboardButton("2 минуты", callback_data='expiration_2')],
-            [InlineKeyboardButton("5 минут", callback_data='expiration_5')]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.message.reply_text("Выберите экспирацию:", reply_markup=reply_markup)
-    
-    elif data.startswith('expiration_'):
-        expiration = int(data.split('expiration_')[1])
-        context.bot_data['expiration'] = expiration
-        await query.message.reply_text(f"Выбрана экспирация: {expiration} мин")
-    
-    elif data == 'get_signal':
-        symbol = context.user_data.get('symbol', 'EURJPY=X')
-        expiration = context.bot_data.get('expiration', 1)
-        print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Запрос сигнала для {symbol} ({DEFAULT_TIMEFRAME}) с экспирацией {expiration} мин")
-        
-        df_5m = get_data(symbol, interval="5m", period="1d")
-        df_15m = get_data(symbol, interval="15m", period="1d")
-        df_1h = get_data(symbol, interval="60m", period="5d")
-        
-        signal, rsi, strength, price, atr, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val, success_probability = analyze(symbol, df_5m, df_15m, df_1h, expiration)
-        
-        if signal != "WAIT" and strength >= 3:
-            entry_time = datetime.now(LOCAL_TZ)
-            message = (f"🚨 *СИГНАЛ по {symbol}*\n"
-                       f"📈 *Прогноз*: {signal}\n"
-                       f"📊 *RSI*: {rsi:.2f}\n"
-                       f"💪 *Сила сигнала*: {strength}/9\n"
-                       f"📝 *Причина*: {reason}\n"
-                       f"💵 *Цена*: {price:.4f}\n"
-                       f"⏱ *Таймфрейм*: {DEFAULT_TIMEFRAME}\n"
-                       f"⏰ *Прогноз на {expiration} мин*\n"
-                       f"🎯 *Вероятность*: {success_probability:.2%}")
-            await send_telegram_message(message)
-            log_result(symbol, signal, rsi, entry_time, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val, atr, price, None, success_probability)
-        else:
-            message = f"⚠️ Сигнал для {symbol} не сформирован (сила: {strength}/9). Причина: {reason}"
-            await send_telegram_message(message)
-        print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] {symbol}: Потенциальный сигнал {signal}, сила={strength}, причина={reason}")
-    
-    elif data == 'refresh_data':
-        data_cache.clear()
-        await query.message.reply_text("Кэш данных очищен")
-        print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Кэш данных очищен")
+    print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Получен callback от chat_id={chat_id}, data={data}")
 
-async def main():
-    print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Бот запускается...")
-    application = Application.builder().token(TELEGRAM_TOKEN).build()
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CallbackQueryHandler(button_callback))
-    
-    print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Запуск автоматического анализа")
-    application.job_queue.run_repeating(run_analysis, interval=300, first=10)
-    
-    print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Бот успешно запущен и начал анализ рынка!")
-    await application.run_polling(timeout=TIMEOUT)
+    for attempt in range(3):
+        try:
+            if data == 'select_pair':
+                await query.message.edit_text("Выберите торговую пару:", reply_markup=get_pair_menu())
+                return
+            elif data == 'select_expiration':
+                await query.message.edit_text("Выберите экспирацию:", reply_markup=get_expiration_menu())
+                return
+            elif data.startswith('pair_'):
+                symbol = data.split('_')[1]
+                user_selections[chat_id] = user_selections.get(chat_id, {})
+                user_selections[chat_id]['symbol'] = symbol
+                await query.message.edit_text(f"Выбрана пара: {symbol.replace('=X', '')}\nВыберите действие:", reply_markup=get_main_menu())
+                return
+            elif data.startswith('expiration_'):
+                expiration = int(data.split('_')[1])
+                user_selections[chat_id] = user_selections.get(chat_id, {})
+                user_selections[chat_id]['expiration'] = expiration
+                context.bot_data['expiration'] = expiration
+                await query.message.edit_text(f"Выбрана экспирация: {expiration} мин\nВыберите действие:", reply_markup=get_main_menu())
+                return
+            elif data == 'get_signal':
+                if chat_id not in user_selections or 'symbol' not in user_selections[chat_id] or 'expiration' not in user_selections[chat_id]:
+                    await query.message.edit_text("Пожалуйста, выберите торговую пару и экспирацию.", reply_markup=get_main_menu())
+                    return
+                symbol = user_selections[chat_id]['symbol']
+                expiration = user_selections[chat_id]['expiration']
+                print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Запрос сигнала для {symbol} ({DEFAULT_TIMEFRAME}) с экспирацией {expiration} мин")
+                df = get_data(symbol, interval=DEFAULT_TIMEFRAME, period="1d")
+                if df is None:
+                    await query.message.edit_text(f"Ошибка получения данных для {symbol.replace('=X', '')} ({DEFAULT_TIMEFRAME}). Попробуйте позже.")
+                    return
+                df_15m = get_data(symbol, interval="15m", period="3d")
+                df_1h = get_data(symbol, interval="60m", period="7d")
+                signal, rsi, strength, price, atr_v, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val, success_probability = analyze(symbol, df, df_15m, df_1h, expiration)
+                if signal != "WAIT":
+                    print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] {symbol}: Потенциальный сигнал {signal}, сила={strength}, причина={reason}")
+                if signal != "WAIT" and strength >= 3:
+                    msg = (
+                        f"🚨 СИГНАЛ по {symbol.replace('=X','')}\n"
+                        f"📈 Прогноз: {signal}\n"
+                        f"📊 RSI: {rsi}\n"
+                        f"💪 Сила сигнала: {strength}/9\n"
+                        f"📝 Причина: {reason}\n"
+                        f"💵 Цена: {price:.4f}\n"
+                        f"⏱ Таймфрейм: {DEFAULT_TIMEFRAME}\n"
+                        f"⏰ Прогноз на {expiration} мин\n"
+                        f"🎯 Вероятность: {success_probability:.2%}"
+                    )
+                    log_result(symbol.replace('=X',''), signal, rsi, datetime.now(LOCAL_TZ).strftime("%H:%M:%S"), reason, rsi_v, adx_v, stoch_v, macd_val, signal_val, atr_v, price, 0.0, success_probability)
+                    send_telegram_message(msg)
+                else:
+                    msg = f"⚠️ Сигнал для {symbol.replace('=X','')} ({DEFAULT_TIMEFRAME}): {signal}\nПричина: {reason}"
+                await query.message.edit_text(msg, reply_markup=get_main_menu())
+                return
+            elif data == 'refresh_data':
+                data_cache.clear()
+                print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Кэш данных очищен")
+                await query.message.edit_text("Данные обновлены.", reply_markup=get_main_menu())
+                return
+            elif data == 'back_to_main':
+                await query.message.edit_text("Выберите действие:", reply_markup=get_main_menu())
+                return
+        except TimedOut as e:
+            print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Тайм-аут в button_callback (попытка {attempt+1}): {e}")
+            if attempt < 2:
+                time.sleep(5 * (2 ** attempt))
+            continue
+        except Exception as e:
+            print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Ошибка в button_callback (попытка {attempt+1}): {e}")
+            if attempt < 2:
+                time.sleep(5 * (2 ** attempt))
+            continue
+    print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Не удалось обработать callback {data} после 3 попыток")
+    send_telegram_message(f"Ошибка: не удалось обработать действие {data}. Проверьте соединение.")
+
+def log_result(symbol, signal, rsi, entry_time, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val, atr_v, entry_price, exit_price, success_probability, outcome="PENDING"):
+    expected_columns = ["Symbol", "Signal", "RSI", "Entry Time", "Logged At", "Reason", "Outcome", "RSI_Value", "ADX_Value", "Stochastic_Value", "MACD_Value", "Signal_Value", "ATR_Value", "Entry_Price", "Exit_Price", "Success_Probability"]
+    try:
+        with open(RESULT_LOG_FILE, 'a', newline='', encoding='utf-8') as f:
+            csv.writer(f).writerow([symbol, signal, rsi, entry_time, datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"), reason, outcome, rsi_v, adx_v, stoch_v, macd_val, signal_val, atr_v, entry_price, exit_price, success_probability])
+        print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Результат записан в лог: {symbol}, {signal}")
+    except Exception as e:
+        print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Ошибка записи в лог результатов: {e}")
+
+def main():
+    try:
+        print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Бот запускается...")
+        if not os.path.exists(RESULT_LOG_FILE):
+            with open(RESULT_LOG_FILE, 'w', newline='', encoding='utf-8') as f:
+                csv.writer(f).writerow(["Symbol", "Signal", "RSI", "Entry Time", "Logged At", "Reason", "Outcome", "RSI_Value", "ADX_Value", "Stochastic_Value", "MACD_Value", "Signal_Value", "ATR_Value", "Entry_Price", "Exit_Price", "Success_Probability"])
+        application = Application.builder().token(TELEGRAM_TOKEN).build()
+        application.job_queue.scheduler.configure(timezone=LOCAL_TZ)
+        application.add_handler(CommandHandler("start", start))
+        application.add_handler(CallbackQueryHandler(button_callback))
+        application.job_queue.run_repeating(run_analysis, interval=300, first=10)
+        send_telegram_message("Бот успешно запущен и начал анализ рынка!")
+        print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Бот запущен, ожидает команды...")
+        application.run_polling()
+    except Exception as e:
+        print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Ошибка при запуске бота: {e}")
 
 if __name__ == '__main__':
-    import asyncio
-    import platform
-    if platform.system() == "Emscripten":
-        asyncio.ensure_future(main())
-    else:
-        asyncio.run(main())
+    main()
