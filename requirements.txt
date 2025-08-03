@@ -1,10 +1,9 @@
-python-telegram-bot==20.0
+python-telegram-bot==20.7
+apscheduler==3.10.4
+pytz
 requests
 pandas
 numpy
-ta
-python-dateutil
-pytz
 beautifulsoup4
 alpha-vantage
-ccxt
+ta
