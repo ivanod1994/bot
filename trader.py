@@ -239,6 +239,10 @@ def analyze(symbol, df_5m, df_15m=None, df_1h=None, expiration=1):
     atr_v = atr.iloc[-1]
     bb_width = (upper_bb - lower_bb) / price
 
+    # Перемещено: вычисление bb_width_mean перед success_probability
+    bb_width_series = (bb.bollinger_hband()[-10:] - bb.bollinger_lband()[-10:]) / close[-10:]
+    bb_width_mean = bb_width_series.mean()
+    
     atr_mean = atr[-10:].mean()
     atr_historical = atr[-20:].mean()  # Исторический ATR для фильтрации
     expected_move = atr_mean * (expiration / 5.0)
@@ -258,8 +262,6 @@ def analyze(symbol, df_5m, df_15m=None, df_1h=None, expiration=1):
     rsi_mean = rsi[-10:].mean()
     rsi_std = rsi[-10:].std()
     adx_mean = adx[-10:].mean()
-    bb_width_series = (bb.bollinger_hband()[-10:] - bb.bollinger_lband()[-10:]) / close[-10:]
-    bb_width_mean = bb_width_series.mean()
     atr_mean = atr[-10:].mean()
 
     RSI_BUY_THRESHOLD = max(30, rsi_mean - rsi_std)
