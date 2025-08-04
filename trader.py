@@ -275,9 +275,6 @@ def analyze(symbol, df_5m, df_15m=None, df_1h=None, expiration=1):
         reason += f"; ATR слишком низкий (< {MIN_ATR})"
         print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] {symbol}: {reason}")
         return "WAIT", round(rsi_v, 2), 0, price, atr_v, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val, success_probability
-    # if not is_active_session() and "JPY" in symbol:
-    #     reason += "; Торговля вне активной сессии для JPY"
-    #     return "WAIT", round(rsi_v, 2), 0, price, atr_v, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val, success_probability
     if is_news_time():
         reason += "; Новости, торговля приостановлена"
         print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] {symbol}: {reason}")
@@ -321,7 +318,7 @@ def analyze(symbol, df_5m, df_15m=None, df_1h=None, expiration=1):
         reason += "Обнаружен бычий фрактал; "
 
     if signal_strength >= 3:
-        if price_high > price * 1.0003:  # Изменено с 1.0005 на 1.0003
+        if price_high > price * 1.0003:
             signal_strength += 1
             reason += f"Прогноз роста на {expiration} мин; "
         else:
@@ -362,7 +359,7 @@ def analyze(symbol, df_5m, df_15m=None, df_1h=None, expiration=1):
         reason += "Обнаружен медвежий фрактал; "
 
     if signal_strength >= 3:
-        if price_low < price * 0.9997:  # Изменено с 0.9995 на 0.9997
+        if price_low < price * 0.9997:
             signal_strength += 1
             reason += f"Прогноз падения на {expiration} мин; "
         else:
