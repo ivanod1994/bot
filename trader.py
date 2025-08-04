@@ -112,7 +112,7 @@ def send_telegram_message(msg, symbol="Unknown"):
         try:
             print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Отправка сигнала для {symbol}: {msg[:50]}...")
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-            response = requests.post(url, data={"chat_id": CHAT_ID, "text": msg}, timeout=60)
+            response = requests.post(url, data={"chat_id": CHAT_ID, "text": msg}, timeout=90)  # Увеличен тайм-аут
             if response.status_code != 200:
                 print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Ошибка Telegram (попытка {attempt+1}): {response.json().get('description', 'Нет деталей')}")
             else:
@@ -160,7 +160,7 @@ def get_data(symbol, interval=DEFAULT_TIMEFRAME, period="1d"):
     for attempt in range(3):
         try:
             url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?range={'3d' if interval == '5m' else period}&interval={interval}"
-            response = session.get(url, headers=HEADERS, timeout=TIMEOUT)  # Исправлено: TIMOUT → TIMEOUT
+            response = session.get(url, headers=HEADERS, timeout=TIMEOUT)
             if response.status_code == 429:
                 print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Ошибка 429, жду перед повтором (попытка {attempt+1})")
                 time.sleep(20 ** attempt)
@@ -273,6 +273,23 @@ def analyze(symbol, df_5m, df_15m=None, df_1h=None, expiration=1):
     }
     print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Адаптивные веса: {weights}")
 
+    # Определение тренда M15
+    trend = "NEUTRAL"
+    m15_macd_confirmed = False
+    if df_15m is not None:
+        try:
+            ema5_m15 = EMAIndicator(df_15m['close'], window=5).ema_indicator().iloc[-1]
+            ema12_m15 = EMAIndicator(df_15m['close'], window=12).ema_indicator().iloc[-1]
+            macd_m15 = MACD(df_15m['close'], window_slow=26, window_fast=12, window_sign=9)
+            macd_m15_val = macd_m15.macd().iloc[-1]
+            signal_m15_val = macd_m15.macd_signal().iloc[-1]
+            trend = "BULLISH" if ema5_m15 > ema12_m15 else "BEARISH" if ema5_m15 < ema12_m15 else "NEUTRAL"
+            m15_macd_confirmed = (macd_m15_val > signal_m15_val) if trend == "BULLISH" else (macd_m15_val < signal_m15_val) if trend == "BEARISH" else False
+        except Exception as e:
+            print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Ошибка расчёта тренда M15 для {symbol}: {e}")
+            trend = "NEUTRAL"
+            m15_macd_confirmed = False
+
     # Динамическая вероятность успеха
     success_probability = 0.50
     if adx_v > 20:
@@ -286,17 +303,6 @@ def analyze(symbol, df_5m, df_15m=None, df_1h=None, expiration=1):
     if df_15m is not None and trend in ["BULLISH", "BEARISH"]:
         success_probability += 0.10
     success_probability = min(success_probability, 0.85)
-
-    trend = "NEUTRAL"
-    m15_macd_confirmed = False
-    if df_15m is not None:
-        ema5_m15 = EMAIndicator(df_15m['close'], window=5).ema_indicator().iloc[-1]
-        ema12_m15 = EMAIndicator(df_15m['close'], window=12).ema_indicator().iloc[-1]
-        macd_m15 = MACD(df_15m['close'], window_slow=26, window_fast=12, window_sign=9)
-        macd_m15_val = macd_m15.macd().iloc[-1]
-        signal_m15_val = macd_m15.macd_signal().iloc[-1]
-        trend = "BULLISH" if ema5_m15 > ema12_m15 else "BEARISH" if ema5_m15 < ema12_m15 else "NEUTRAL"
-        m15_macd_confirmed = (macd_m15_val > signal_m15_val) if trend == "BULLISH" else (macd_m15_val < signal_m15_val) if trend == "BEARISH" else False
 
     reason = (f"RSI: {rsi_v:.2f}, ADX: {adx_v:.2f}, Stochastic: {stoch_v:.2f}, MACD: {macd_val:.4f}, "
               f"Signal: {signal_val:.4f}, ATR: {atr_v:.4f}, BB_Width: {bb_width:.4f}, Trend M15: {trend}, "
@@ -629,7 +635,7 @@ def main():
         application.job_queue.scheduler.configure(timezone=LOCAL_TZ)
         application.add_handler(CommandHandler("start", start))
         application.add_handler(CallbackQueryHandler(button_callback))
-        application.job_queue.run_repeating(run_analysis, interval=90, first=10)  # Увеличен интервал до 90 секунд
+        application.job_queue.run_repeating(run_analysis, interval=90, first=10)
         send_telegram_message("Бот успешно запущен и начал анализ рынка!")
         print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Бот запущен, ожидает команды...")
         application.run_polling()
