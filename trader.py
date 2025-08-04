@@ -160,7 +160,7 @@ def get_data(symbol, interval=DEFAULT_TIMEFRAME, period="1d"):
     for attempt in range(3):
         try:
             url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?range={'3d' if interval == '5m' else period}&interval={interval}"
-            response = session.get(url, headers=HEADERS, timeout=TIMEOUT)
+            response = session.get(url, headers=HEADERS, timeout=TIMOUT)
             if response.status_code == 429:
                 print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Ошибка 429, жду перед повтором (попытка {attempt+1})")
                 time.sleep(20 ** attempt)
@@ -251,29 +251,29 @@ def analyze(symbol, df_5m, df_15m=None, df_1h=None, expiration=1):
     rsi_std = rsi[-10:].std()
     adx_mean = adx[-10:].mean()
     
-    RSI_BUY_THRESHOLD = max(30, rsi_mean - rsi_std * (1 - 0.2 * market_volatility))
-    RSI_SELL_THRESHOLD = min(70, rsi_mean + rsi_std * (1 - 0.2 * market_volatility))
-    MIN_ADX = max(20, adx_mean * 0.7 * (1 - 0.2 * trend_strength))
-    BB_WIDTH_MIN = max(0.0005, bb_width_mean * 0.5 * (1 + 0.2 * market_volatility))
+    RSI_BUY_THRESHOLD = max(30, rsi_mean - rsi_std * (1 - 0.3 * market_volatility))
+    RSI_SELL_THRESHOLD = min(70, rsi_mean + rsi_std * (1 - 0.3 * market_volatility))
+    MIN_ADX = max(15, adx_mean * 0.6 * (1 - 0.3 * trend_strength))  # Снижен базовый порог до 15
+    BB_WIDTH_MIN = max(0.0003, bb_width_mean * 0.4 * (1 + 0.3 * market_volatility))  # Снижен до 0.0003
     MIN_ATR = atr_mean * 0.5 * (1 - 0.2 * market_volatility)
 
     # Адаптивные веса условий
     weights = {
-        'rsi': 1.0 + 0.2 * (1 - trend_strength),  # Больше вес RSI при слабом тренде
-        'macd': 2.0 + 0.3 * market_volatility,   # Больше вес MACD при высокой волатильности
+        'rsi': 1.0 + 0.3 * (1 - trend_strength),  # Увеличен вес при слабом тренде
+        'macd': 2.0 + 0.4 * market_volatility,   # Увеличен вес при высокой волатильности
         'ema': 2.0,
-        'stoch': 1.0 + 0.2 * (1 - trend_strength),  # Больше вес Stochastic при слабом тренде
+        'stoch': 1.0 + 0.3 * (1 - trend_strength),  # Увеличен вес при слабом тренде
         'bb': 1.0,
-        'trend': 1.0,
+        'trend': 1.2 + 0.2 * (1 - trend_strength),  # Увеличен вес тренда M15
         'candle': 1.0,
         'price_trend': 1.0,
-        'fractal': 1.0 + 0.2 * market_volatility  # Больше вес фракталов при высокой волатильности
+        'fractal': 1.2 + 0.3 * market_volatility  # Увеличен вес фракталов
     }
     print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Адаптивные веса: {weights}")
 
     # Динамическая вероятность успеха
     success_probability = 0.50
-    if adx_v > 25:
+    if adx_v > 20:
         success_probability += 0.15
     if bb_width > bb_width_mean * 1.2:
         success_probability += 0.10
@@ -281,6 +281,8 @@ def analyze(symbol, df_5m, df_15m=None, df_1h=None, expiration=1):
         success_probability += 0.05
     if market_volatility > 1.2:
         success_probability += 0.05
+    if df_15m is not None and trend in ["BULLISH", "BEARISH"]:
+        success_probability += 0.10  # Бонус за тренд на M15
     success_probability = min(success_probability, 0.85)
 
     trend = "NEUTRAL"
@@ -472,7 +474,7 @@ async def run_analysis(context: ContextTypes.DEFAULT_TYPE):
                         f"📝 Причина: {reason}\n"
                         f"💵 Цена: {price:.4f}\n"
                         f"⏱ Таймфрейм: {DEFAULT_TIMEFRAME}\n"
-                        f"⏰ Прогноз на 1 мин\n"
+                        f"⏰ Прогноз на {expiration} мин\n"
                         f"🎯 Вероятность: {success_probability:.2%}"
                     )
                     log_result(symbol.replace('=X',''), signal, rsi, datetime.now(LOCAL_TZ).strftime("%H:%M:%S"), reason, rsi_v, adx_v, stoch_v, macd_val, signal_val, atr_v, price, 0.0, success_probability)
