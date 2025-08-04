@@ -48,7 +48,7 @@ CORRELATION_PAIRS = {
 }
 ACCOUNT_BALANCE = 10000  # Депозит для расчёта риска
 RISK_PER_TRADE = 0.005  # 0.5% на сделку
-MIN_SUCCESS_PROBABILITY = 0.70
+MIN_SUCCESS_PROBABILITY = 0.60  # Снижено с 0.70
 MIN_SIGNAL_STRENGTH = 4.5
 MAX_ACTIVE_TRADES = 3
 # =================
@@ -343,7 +343,6 @@ def analyze(symbol, df_5m, df_15m=None, df_1h=None, expiration=1):
         STOCH_SELL_THRESHOLD = min(90, 85 + 5 * (1 - market_volatility))
         MIN_ADX = max(15, adx_mean * 0.7) if market_volatility > 1.5 else max(10, adx_mean * 0.5)
         BB_WIDTH_MIN = max(0.00015, bb_width_mean * 0.3) if market_volatility > 1.5 else max(0.0001, bb_width_mean * 0.2)
-        MIN_ATR = atr_mean * 0.3 * (1 - 0.2 * market_volatility)
 
         print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] {symbol}: market_volatility={market_volatility:.2f}, trend_strength={trend_strength:.2f}, MIN_ADX={MIN_ADX:.2f}, BB_WIDTH_MIN={BB_WIDTH_MIN:.4f}")
 
@@ -535,8 +534,8 @@ def analyze(symbol, df_5m, df_15m=None, df_1h=None, expiration=1):
                 take_profit = price * (1.001 + atr_v * 2.0)
                 reward_risk_ratio = abs(take_profit - price) / abs(price - stop_loss)
                 lot_size = min(1.0, RISK_PER_TRADE * ACCOUNT_BALANCE / abs(price - stop_loss))
-                if reward_risk_ratio < 1.5:
-                    reason_add += f"; Низкое соотношение риск/прибыль ({reward_risk_ratio:.2f} < 1.5)"
+                if reward_risk_ratio < 1.2:  # Снижено с 1.5
+                    reason_add += f"; Низкое соотношение риск/прибыль ({reward_risk_ratio:.2f} < 1.2)"
                     print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] {symbol}: {reason_add}")
                     return "WAIT", round(rsi_v, 2), 0, price, atr_v, reason + "; " + reason_add, rsi_v, adx_v, stoch_v, macd_val, signal_val, success_probability, 0, 0, 0
                 reason = reason + "; " + reason_add
@@ -609,8 +608,8 @@ def analyze(symbol, df_5m, df_15m=None, df_1h=None, expiration=1):
                 take_profit = price * (0.999 - atr_v * 2.0)
                 reward_risk_ratio = abs(take_profit - price) / abs(price - stop_loss)
                 lot_size = min(1.0, RISK_PER_TRADE * ACCOUNT_BALANCE / abs(price - stop_loss))
-                if reward_risk_ratio < 1.5:
-                    reason_add += f"; Низкое соотношение риск/прибыль ({reward_risk_ratio:.2f} < 1.5)"
+                if reward_risk_ratio < 1.2:  # Снижено с 1.5
+                    reason_add += f"; Низкое соотношение риск/прибыль ({reward_risk_ratio:.2f} < 1.2)"
                     print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] {symbol}: {reason_add}")
                     return "WAIT", round(rsi_v, 2), 0, price, atr_v, reason + "; " + reason_add, rsi_v, adx_v, stoch_v, macd_val, signal_val, success_probability, 0, 0, 0
                 reason = reason + "; " + reason_add
@@ -716,11 +715,14 @@ async def auto_analyze(context: ContextTypes.DEFAULT_TYPE):
                     writer.writerow(["Time", "Symbol", "Signal", "Entry_Price", "Stop_Loss", "Take_Profit", "Lot_Size", "Success_Probability", "Signal_Strength", "Reason", "Outcome", "Exit_Price"])
                 writer.writerow([datetime.now(LOCAL_TZ).strftime("%H:%M:%S"), symbol, signal, price, stop_loss, take_profit, lot_size, success_probability, signal_strength, reason, "PENDING", price])
 
-def update_results():
+async def update_results(context: ContextTypes.DEFAULT_TYPE):
+    print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Запуск обновления результатов")
     if not os.path.exists(RESULT_LOG_FILE):
+        print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Файл {RESULT_LOG_FILE} не существует")
         return
     df = pd.read_csv(RESULT_LOG_FILE)
     if df.empty:
+        print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Файл {RESULT_LOG_FILE} пуст")
         return
     
     for idx, row in df.iterrows():
@@ -734,6 +736,7 @@ def update_results():
             send_telegram_message(f"Сигнал для {row['Symbol']} закрыт: {outcome}, Цена выхода: {exit_price:.5f}")
     
     df.to_csv(RESULT_LOG_FILE, index=False)
+    print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Результаты сохранены в {RESULT_LOG_FILE}")
     
     # Отчёт по статистике
     if len(df[df['Outcome'].isin(['WIN', 'LOSS'])]) >= 10:
@@ -744,6 +747,7 @@ def update_results():
                f"Win Rate: {win_rate:.2%}\n"
                f"Средняя вероятность WIN: {win_prob:.2%}\n"
                f"Средняя вероятность LOSS: {loss_prob:.2%}")
+        print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Отправка статистики: {msg}")
         send_telegram_message(msg)
 
 def main():
