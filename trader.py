@@ -37,6 +37,15 @@ TIMEOUT = 30
 MIN_SIGNAL_INTERVAL = 60
 VOLUME_MULTIPLIER = float('inf')
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"}
+CORRELATION_PAIRS = {
+    "EURUSD=X": ["GBPUSD=X", "AUDUSD=X"],  # Положительная корреляция
+    "GBPUSD=X": ["EURUSD=X", "AUDUSD=X"],
+    "AUDUSD=X": ["EURUSD=X", "GBPUSD=X"],
+    "CADJPY=X": ["EURJPY=X", "CHFJPY=X"],
+    "EURJPY=X": ["CADJPY=X", "CHFJPY=X"],
+    "CHFJPY=X": ["CADJPY=X", "EURJPY=X"],
+    "USDCAD=X": []  # Обратная корреляция с USD-парами, не используем
+}
 # =================
 
 data_cache = {}
@@ -112,7 +121,7 @@ def send_telegram_message(msg, symbol="Unknown"):
         try:
             print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Отправка сигнала для {symbol}: {msg[:50]}...")
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-            response = requests.post(url, data={"chat_id": CHAT_ID, "text": msg}, timeout=90)
+            response = requests.post(url, data={"chat_id": CHAT_ID, "text": msg}, timeout=120)
             if response.status_code != 200:
                 print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Ошибка Telegram (попытка {attempt+1}): {response.json().get('description', 'Нет деталей')}")
             else:
@@ -138,17 +147,42 @@ def detect_fractals(df, window=3):
             df['low'].iloc[i] < df['low'].iloc[i-2] and
             df['low'].iloc[i] < df['low'].iloc[i+1] and
             df['low'].iloc[i] < df['low'].iloc[i+2] and
-            volume.iloc[i] > avg_volume.iloc[i] * 1.1):  # Снижено с 1.2
+            volume.iloc[i] > avg_volume.iloc[i] * 1.1):
             bullish_fractals.iloc[i] = True
         
         if (df['high'].iloc[i] > df['high'].iloc[i-1] and
             df['high'].iloc[i] > df['high'].iloc[i-2] and
             df['high'].iloc[i] > df['high'].iloc[i+1] and
             df['high'].iloc[i] > df['high'].iloc[i+2] and
-            volume.iloc[i] > avg_volume.iloc[i] * 1.1):  # Снижено с 1.2
+            volume.iloc[i] > avg_volume.iloc[i] * 1.1):
             bearish_fractals.iloc[i] = True
     
     return bullish_fractals, bearish_fractals
+
+def get_correlation_confirmation(symbol, signal, df_5m, expiration=1):
+    if symbol not in CORRELATION_PAIRS or not CORRELATION_PAIRS[symbol]:
+        return False, "Нет коррелированных пар"
+    
+    confirmation = False
+    reason = ""
+    for corr_symbol in CORRELATION_PAIRS[symbol]:
+        df_corr = get_data(corr_symbol, interval=DEFAULT_TIMEFRAME, period="3d")
+        if df_corr is None:
+            reason += f"Нет данных для {corr_symbol}; "
+            continue
+        
+        close = df_corr['close']
+        ema5 = EMAIndicator(close, window=5).ema_indicator().iloc[-1]
+        ema12 = EMAIndicator(close, window=12).ema_indicator().iloc[-1]
+        
+        if signal == "BUY" and ema5 > ema12:
+            confirmation = True
+            reason += f"Бычий тренд подтверждён на {corr_symbol}; "
+        elif signal == "SELL" and ema5 < ema12:
+            confirmation = True
+            reason += f"Медвежий тренд подтверждён на {corr_symbol}; "
+    
+    return confirmation, reason
 
 def get_data(symbol, interval=DEFAULT_TIMEFRAME, period="1d"):
     cache_key = f"{symbol}_{interval}"
@@ -251,8 +285,10 @@ def analyze(symbol, df_5m, df_15m=None, df_1h=None, expiration=1):
     rsi_std = rsi[-10:].std()
     adx_mean = adx[-10:].mean()
     
-    RSI_BUY_THRESHOLD = max(30, rsi_mean - rsi_std * (1 - 0.3 * market_volatility))
-    RSI_SELL_THRESHOLD = min(70, rsi_mean + rsi_std * (1 - 0.3 * market_volatility))
+    RSI_BUY_THRESHOLD = max(25, rsi_mean - rsi_std * (1 - 0.4 * market_volatility))  # Увеличена чувствительность
+    RSI_SELL_THRESHOLD = min(75, rsi_mean + rsi_std * (1 - 0.4 * market_volatility))  # Увеличена чувствительность
+    STOCH_BUY_THRESHOLD = max(20, 30 - 10 * (1 - market_volatility))  # Динамический порог
+    STOCH_SELL_THRESHOLD = min(80, 70 + 10 * (1 - market_volatility))  # Динамический порог
     MIN_ADX = max(12, adx_mean * 0.6 * (1 - 0.3 * trend_strength))
     BB_WIDTH_MIN = max(0.0003, bb_width_mean * 0.4 * (1 + 0.3 * market_volatility))
     MIN_ATR = atr_mean * 0.5 * (1 - 0.2 * market_volatility)
@@ -262,7 +298,7 @@ def analyze(symbol, df_5m, df_15m=None, df_1h=None, expiration=1):
     # Адаптивные веса условий
     weights = {
         'rsi': 1.0 + 0.3 * (1 - trend_strength),
-        'macd': 2.5 + 0.4 * market_volatility,  # Увеличен вес
+        'macd': 2.5 + 0.4 * market_volatility,
         'ema': 2.0,
         'stoch': 1.0 + 0.3 * (1 - trend_strength),
         'bb': 1.0,
@@ -270,13 +306,16 @@ def analyze(symbol, df_5m, df_15m=None, df_1h=None, expiration=1):
         'candle': 1.0,
         'price_trend': 1.0,
         'fractal': 1.2 + 0.3 * market_volatility,
-        'volume': 1.0  # Новый вес
+        'volume': 1.0,
+        'correlation': 1.2  # Новый вес для корреляции
     }
     print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Адаптивные веса: {weights}")
 
-    # Определение тренда M15
-    trend = "NEUTRAL"
+    # Определение тренда M15 и H1
+    trend_m15 = "NEUTRAL"
+    trend_h1 = "NEUTRAL"
     m15_macd_confirmed = False
+    h1_trend_confirmed = False
     if df_15m is not None:
         try:
             ema5_m15 = EMAIndicator(df_15m['close'], window=5).ema_indicator().iloc[-1]
@@ -284,12 +323,27 @@ def analyze(symbol, df_5m, df_15m=None, df_1h=None, expiration=1):
             macd_m15 = MACD(df_15m['close'], window_slow=26, window_fast=12, window_sign=9)
             macd_m15_val = macd_m15.macd().iloc[-1]
             signal_m15_val = macd_m15.macd_signal().iloc[-1]
-            trend = "BULLISH" if ema5_m15 > ema12_m15 else "BEARISH" if ema5_m15 < ema12_m15 else "NEUTRAL"
-            m15_macd_confirmed = (macd_m15_val > signal_m15_val) if trend == "BULLISH" else (macd_m15_val < signal_m15_val) if trend == "BEARISH" else False
+            trend_m15 = "BULLISH" if ema5_m15 > ema12_m15 else "BEARISH" if ema5_m15 < ema12_m15 else "NEUTRAL"
+            m15_macd_confirmed = (macd_m15_val > signal_m15_val) if trend_m15 == "BULLISH" else (macd_m15_val < signal_m15_val) if trend_m15 == "BEARISH" else False
         except Exception as e:
             print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Ошибка расчёта тренда M15 для {symbol}: {e}")
-            trend = "NEUTRAL"
+            trend_m15 = "NEUTRAL"
             m15_macd_confirmed = False
+    
+    if df_1h is not None:
+        try:
+            ema5_h1 = EMAIndicator(df_1h['close'], window=5).ema_indicator().iloc[-1]
+            ema12_h1 = EMAIndicator(df_1h['close'], window=12).ema_indicator().iloc[-1]
+            trend_h1 = "BULLISH" if ema5_h1 > ema12_h1 else "BEARISH" if ema5_h1 < ema12_h1 else "NEUTRAL"
+            h1_trend_confirmed = trend_h1 == trend_m15 and trend_m15 != "NEUTRAL"
+        except Exception as e:
+            print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Ошибка расчёта тренда H1 для {symbol}: {e}")
+            trend_h1 = "NEUTRAL"
+            h1_trend_confirmed = False
+
+    # Проверка резкого роста ATR и объёма
+    atr_spike = atr_v > atr_historical * 1.3
+    volume_trend = volume.iloc[-1] > volume[-10:].mean() * 1.2
 
     # Динамическая вероятность успеха
     success_probability = 0.50
@@ -301,20 +355,21 @@ def analyze(symbol, df_5m, df_15m=None, df_1h=None, expiration=1):
         success_probability += 0.05
     if market_volatility > 1.2:
         success_probability += 0.05
-    if df_15m is not None and trend in ["BULLISH", "BEARISH"]:
+    if trend_m15 in ["BULLISH", "BEARISH"]:
         success_probability += 0.10
+    if h1_trend_confirmed:
+        success_probability += 0.05
+    if atr_spike:
+        success_probability += 0.05
+    if volume_trend:
+        success_probability += 0.05
     success_probability = min(success_probability, 0.85)
 
     reason = (f"RSI: {rsi_v:.2f}, ADX: {adx_v:.2f}, Stochastic: {stoch_v:.2f}, MACD: {macd_val:.4f}, "
-              f"Signal: {signal_val:.4f}, ATR: {atr_v:.4f}, BB_Width: {bb_width:.4f}, Trend M15: {trend}, "
-              f"Expected Move: ±{expected_move:.4f}, Success Probability: {success_probability:.2%}")
+              f"Signal: {signal_val:.4f}, ATR: {atr_v:.4f}, BB_Width: {bb_width:.4f}, Trend M15: {trend_m15}, "
+              f"Trend H1: {trend_h1}, Expected Move: ±{expected_move:.4f}, Success Probability: {success_probability:.2%}")
 
     # Фильтры
-    # if atr_v < atr_historical * 0.8:
-    #     reason += "; Низкая текущая волатильность (ATR ниже исторического)"
-    #     print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] {symbol}: {reason}")
-    #     return "WAIT", round(rsi_v, 2), 0, price, atr_v, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val, success_probability
-
     if adx_v < MIN_ADX:
         reason += f"; ADX слишком низкий (< {MIN_ADX:.2f})"
         print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] {symbol}: {reason}")
@@ -339,8 +394,8 @@ def analyze(symbol, df_5m, df_15m=None, df_1h=None, expiration=1):
             return all(macd.macd().iloc[-i] < macd.macd_signal().iloc[-i] for i in range(1, candles + 1))
         return False
 
-    # Проверка роста объёма
-    volume_trend = volume.iloc[-1] > volume[-10:].mean() * 1.2
+    # Проверка корреляции
+    corr_confirmed, corr_reason = get_correlation_confirmation(symbol, "BUY", df_5m, expiration)
 
     signal_strength = 0
     reason = ""
@@ -353,15 +408,18 @@ def analyze(symbol, df_5m, df_15m=None, df_1h=None, expiration=1):
     if ema5_v > ema12_v and ema5.iloc[-2] <= ema12.iloc[-2]:
         signal_strength += weights['ema']
         reason += "EMA5 пересекает EMA12 вверх; "
-    if stoch_v < 30:
+    if stoch_v < STOCH_BUY_THRESHOLD:
         signal_strength += weights['stoch']
         reason += "Stochastic перепродан; "
     if price < lower_bb * 1.005:
         signal_strength += weights['bb']
         reason += "Цена ниже Bollinger; "
-    if df_15m is not None and trend == "BULLISH":
+    if trend_m15 == "BULLISH":
         signal_strength += weights['trend']
         reason += "Бычий тренд на M15; "
+    if trend_h1 == "BULLISH" and h1_trend_confirmed:
+        signal_strength += weights['trend'] * 0.5
+        reason += "Бычий тренд на H1; "
     if close.iloc[-1] > open_price and macd_val > signal_val:
         signal_strength += weights['candle']
         reason += "Бычья свеча с MACD подтверждением; "
@@ -374,9 +432,12 @@ def analyze(symbol, df_5m, df_15m=None, df_1h=None, expiration=1):
     if volume_trend:
         signal_strength += weights['volume']
         reason += "Рост объёма; "
+    if corr_confirmed:
+        signal_strength += weights['correlation']
+        reason += corr_reason
 
     if signal_strength >= 3:
-        if price_high > price * 1.0002:  # Снижено с 1.0003
+        if price_high > price * 1.0002:
             signal_strength += 1
             reason += f"Прогноз роста на {expiration} мин; "
         else:
@@ -386,6 +447,9 @@ def analyze(symbol, df_5m, df_15m=None, df_1h=None, expiration=1):
         if signal_strength >= 3:
             print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] {symbol}: BUY сигнал, сила={signal_strength:.2f}, причина={reason}")
             return "BUY", round(rsi_v, 2), signal_strength, price, atr_v, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val, success_probability
+
+    # Проверка корреляции для SELL
+    corr_confirmed, corr_reason = get_correlation_confirmation(symbol, "SELL", df_5m, expiration)
 
     signal_strength = 0
     reason = ""
@@ -398,15 +462,18 @@ def analyze(symbol, df_5m, df_15m=None, df_1h=None, expiration=1):
     if ema5_v < ema12_v and ema5.iloc[-2] >= ema12.iloc[-2]:
         signal_strength += weights['ema']
         reason += "EMA5 пересекает EMA12 вниз; "
-    if stoch_v > 70:
+    if stoch_v > STOCH_SELL_THRESHOLD:
         signal_strength += weights['stoch']
         reason += "Stochastic перекуплен; "
     if price > upper_bb * 0.995:
         signal_strength += weights['bb']
         reason += "Цена выше Bollinger; "
-    if df_15m is not None and trend == "BEARISH":
+    if trend_m15 == "BEARISH":
         signal_strength += weights['trend']
         reason += "Медвежий тренд на M15; "
+    if trend_h1 == "BEARISH" and h1_trend_confirmed:
+        signal_strength += weights['trend'] * 0.5
+        reason += "Медвежий тренд на H1; "
     if close.iloc[-1] < open_price and macd_val < signal_val:
         signal_strength += weights['candle']
         reason += "Медвежья свеча с MACD подтверждением; "
@@ -419,9 +486,12 @@ def analyze(symbol, df_5m, df_15m=None, df_1h=None, expiration=1):
     if volume_trend:
         signal_strength += weights['volume']
         reason += "Рост объёма; "
+    if corr_confirmed:
+        signal_strength += weights['correlation']
+        reason += corr_reason
 
     if signal_strength >= 3:
-        if price_low < price * 0.9998:  # Снижено с 0.9997
+        if price_low < price * 0.9998:
             signal_strength += 1
             reason += f"Прогноз падения на {expiration} мин; "
         else:
@@ -489,7 +559,7 @@ async def run_analysis(context: ContextTypes.DEFAULT_TYPE):
                         f"🚨 СИГНАЛ по {symbol.replace('=X','')}\n"
                         f"📈 Прогноз: {signal}\n"
                         f"📊 RSI: {rsi}\n"
-                        f"💪 Сила сигнала: {strength:.2f}/10\n"  # Учитываем новый вес volume
+                        f"💪 Сила сигнала: {strength:.2f}/11\n"  # Учитываем correlation
                         f"📝 Причина: {reason}\n"
                         f"💵 Цена: {price:.4f}\n"
                         f"⏱ Таймфрейм: {DEFAULT_TIMEFRAME}\n"
@@ -529,7 +599,7 @@ def get_expiration_menu():
 
 def get_signal_strength_menu():
     strengths = [3, 4, 5]
-    keyboard = [[InlineKeyboardButton(f"Сила {strength}/10", callback_data=f'signal_strength_{strength}')] for strength in strengths]  # Учитываем новый вес volume
+    keyboard = [[InlineKeyboardButton(f"Сила {strength}/11", callback_data=f'signal_strength_{strength}')] for strength in strengths]
     keyboard.append([InlineKeyboardButton("Назад", callback_data='back_to_main')])
     return InlineKeyboardMarkup(keyboard)
 
@@ -567,7 +637,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             elif data.startswith('signal_strength_'):
                 strength = int(data.split('_')[2])
                 context.bot_data['auto_signal_strength'] = strength
-                await query.message.edit_text(f"Выбрана минимальная сила сигнала для автоанализа: {strength}/10\nВыберите действие:", reply_markup=get_main_menu())
+                await query.message.edit_text(f"Выбрана минимальная сила сигнала для автоанализа: {strength}/11\nВыберите действие:", reply_markup=get_main_menu())
                 return
             elif data == 'get_signal':
                 if chat_id not in user_selections or 'symbol' not in user_selections[chat_id] or 'expiration' not in user_selections[chat_id]:
@@ -591,7 +661,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         f"🚨 СИГНАЛ по {symbol.replace('=X','')}\n"
                         f"📈 Прогноз: {signal}\n"
                         f"📊 RSI: {rsi}\n"
-                        f"💪 Сила сигнала: {strength:.2f}/10\n"
+                        f"💪 Сила сигнала: {strength:.2f}/11\n"
                         f"📝 Причина: {reason}\n"
                         f"💵 Цена: {price:.4f}\n"
                         f"⏱ Таймфрейм: {DEFAULT_TIMEFRAME}\n"
