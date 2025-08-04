@@ -112,7 +112,7 @@ def send_telegram_message(msg, symbol="Unknown"):
         try:
             print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Отправка сигнала для {symbol}: {msg[:50]}...")
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-            response = requests.post(url, data={"chat_id": CHAT_ID, "text": msg}, timeout=90)  # Увеличен тайм-аут
+            response = requests.post(url, data={"chat_id": CHAT_ID, "text": msg}, timeout=90)
             if response.status_code != 200:
                 print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Ошибка Telegram (попытка {attempt+1}): {response.json().get('description', 'Нет деталей')}")
             else:
@@ -253,7 +253,7 @@ def analyze(symbol, df_5m, df_15m=None, df_1h=None, expiration=1):
     
     RSI_BUY_THRESHOLD = max(30, rsi_mean - rsi_std * (1 - 0.3 * market_volatility))
     RSI_SELL_THRESHOLD = min(70, rsi_mean + rsi_std * (1 - 0.3 * market_volatility))
-    MIN_ADX = max(15, adx_mean * 0.6 * (1 - 0.3 * trend_strength))
+    MIN_ADX = max(12, adx_mean * 0.6 * (1 - 0.3 * trend_strength))  # Снижено с 15 до 12
     BB_WIDTH_MIN = max(0.0003, bb_width_mean * 0.4 * (1 + 0.3 * market_volatility))
     MIN_ATR = atr_mean * 0.5 * (1 - 0.2 * market_volatility)
 
@@ -266,7 +266,7 @@ def analyze(symbol, df_5m, df_15m=None, df_1h=None, expiration=1):
         'ema': 2.0,
         'stoch': 1.0 + 0.3 * (1 - trend_strength),
         'bb': 1.0,
-        'trend': 1.2 + 0.2 * (1 - trend_strength),
+        'trend': 1.5 + 0.3 * (1 - trend_strength),  # Увеличен вес тренда M15
         'candle': 1.0,
         'price_trend': 1.0,
         'fractal': 1.2 + 0.3 * market_volatility
@@ -471,6 +471,7 @@ async def run_analysis(context: ContextTypes.DEFAULT_TYPE):
             df_15m = get_data(symbol, interval="15m", period="3d")
             df_1h = get_data(symbol, interval="60m", period="7d")
             signal, rsi, strength, price, atr_v, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val, success_probability = analyze(symbol, df, df_15m, df_1h, expiration)
+            print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] {symbol}: Завершён анализ, результат: {signal}, сила={strength:.2f}, причина={reason}")
             if signal != "WAIT":
                 print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] {symbol}: Потенциальный сигнал {signal}, сила={strength:.2f}, причина={reason}")
                 if strength >= min_signal_strength:
@@ -572,6 +573,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 df_15m = get_data(symbol, interval="15m", period="3d")
                 df_1h = get_data(symbol, interval="60m", period="7d")
                 signal, rsi, strength, price, atr_v, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val, success_probability = analyze(symbol, df, df_15m, df_1h, expiration)
+                print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] {symbol}: Завершён анализ, результат: {signal}, сила={strength:.2f}, причина={reason}")
                 if signal != "WAIT":
                     print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] {symbol}: Потенциальный сигнал {signal}, сила={strength:.2f}, причина={reason}")
                 if signal != "WAIT" and strength >= 3:
@@ -635,7 +637,7 @@ def main():
         application.job_queue.scheduler.configure(timezone=LOCAL_TZ)
         application.add_handler(CommandHandler("start", start))
         application.add_handler(CallbackQueryHandler(button_callback))
-        application.job_queue.run_repeating(run_analysis, interval=90, first=10)
+        application.job_queue.run_repeating(run_analysis, interval=120, first=10)  # Увеличен интервал до 120 секунд
         send_telegram_message("Бот успешно запущен и начал анализ рынка!")
         print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Бот запущен, ожидает команды...")
         application.run_polling()
