@@ -125,10 +125,6 @@ def send_telegram_message(msg, symbol="Unknown"):
     return False
 
 def detect_fractals(df, window=3):
-    """
-    Определяет бычьи и медвежьи фракталы с учётом объёма.
-    Возвращает два Series: bullish_fractals и bearish_fractals (True, если фрактал подтверждён).
-    """
     if len(df) < 5:
         return pd.Series(False, index=df.index), pd.Series(False, index=df.index)
     
@@ -142,14 +138,14 @@ def detect_fractals(df, window=3):
             df['low'].iloc[i] < df['low'].iloc[i-2] and
             df['low'].iloc[i] < df['low'].iloc[i+1] and
             df['low'].iloc[i] < df['low'].iloc[i+2] and
-            volume.iloc[i] > avg_volume.iloc[i] * 1.2):  # Объём выше среднего
+            volume.iloc[i] > avg_volume.iloc[i] * 1.2):
             bullish_fractals.iloc[i] = True
         
         if (df['high'].iloc[i] > df['high'].iloc[i-1] and
             df['high'].iloc[i] > df['high'].iloc[i-2] and
             df['high'].iloc[i] > df['high'].iloc[i+1] and
             df['high'].iloc[i] > df['high'].iloc[i+2] and
-            volume.iloc[i] > avg_volume.iloc[i] * 1.2):  # Объём выше среднего
+            volume.iloc[i] > avg_volume.iloc[i] * 1.2):
             bearish_fractals.iloc[i] = True
     
     return bullish_fractals, bearish_fractals
@@ -239,36 +235,53 @@ def analyze(symbol, df_5m, df_15m=None, df_1h=None, expiration=1):
     atr_v = atr.iloc[-1]
     bb_width = (upper_bb - lower_bb) / price
 
-    # Перемещено: вычисление bb_width_mean перед success_probability
     bb_width_series = (bb.bollinger_hband()[-10:] - bb.bollinger_lband()[-10:]) / close[-10:]
     bb_width_mean = bb_width_series.mean()
     
     atr_mean = atr[-10:].mean()
-    atr_historical = atr[-20:].mean()  # Исторический ATR для фильтрации
+    atr_historical = atr[-20:].mean()
     expected_move = atr_mean * (expiration / 5.0)
     price_high = price + expected_move
     price_low = price - expected_move
 
-    # Динамическая вероятность успеха
-    success_probability = 0.50  # Базовая вероятность
-    if adx_v > 25:
-        success_probability += 0.15  # Сильный тренд
-    if bb_width > bb_width_mean * 1.2:
-        success_probability += 0.10  # Высокая волатильность
-    if bullish_fractals.iloc[-5:].any() or bearish_fractals.iloc[-5:].any():
-        success_probability += 0.05  # Подтверждённый фрактал
-    success_probability = min(success_probability, 0.85)  # Ограничение до 85%
-
+    # Адаптивные пороги
+    market_volatility = atr_v / atr_historical
+    trend_strength = adx_v / adx[-10:].mean()
     rsi_mean = rsi[-10:].mean()
     rsi_std = rsi[-10:].std()
     adx_mean = adx[-10:].mean()
-    atr_mean = atr[-10:].mean()
+    
+    RSI_BUY_THRESHOLD = max(30, rsi_mean - rsi_std * (1 - 0.2 * market_volatility))
+    RSI_SELL_THRESHOLD = min(70, rsi_mean + rsi_std * (1 - 0.2 * market_volatility))
+    MIN_ADX = max(20, adx_mean * 0.7 * (1 - 0.2 * trend_strength))
+    BB_WIDTH_MIN = max(0.0005, bb_width_mean * 0.5 * (1 + 0.2 * market_volatility))
+    MIN_ATR = atr_mean * 0.5 * (1 - 0.2 * market_volatility)
 
-    RSI_BUY_THRESHOLD = max(30, rsi_mean - rsi_std)
-    RSI_SELL_THRESHOLD = min(70, rsi_mean + rsi_std)
-    MIN_ADX = max(20, adx_mean * 0.7)
-    BB_WIDTH_MIN = max(0.0005, bb_width_mean * 0.5)
-    MIN_ATR = atr_mean * 0.5
+    # Адаптивные веса условий
+    weights = {
+        'rsi': 1.0 + 0.2 * (1 - trend_strength),  # Больше вес RSI при слабом тренде
+        'macd': 2.0 + 0.3 * market_volatility,   # Больше вес MACD при высокой волатильности
+        'ema': 2.0,
+        'stoch': 1.0 + 0.2 * (1 - trend_strength),  # Больше вес Stochastic при слабом тренде
+        'bb': 1.0,
+        'trend': 1.0,
+        'candle': 1.0,
+        'price_trend': 1.0,
+        'fractal': 1.0 + 0.2 * market_volatility  # Больше вес фракталов при высокой волатильности
+    }
+    print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Адаптивные веса: {weights}")
+
+    # Динамическая вероятность успеха
+    success_probability = 0.50
+    if adx_v > 25:
+        success_probability += 0.15
+    if bb_width > bb_width_mean * 1.2:
+        success_probability += 0.10
+    if bullish_fractals.iloc[-5:].any() or bearish_fractals.iloc[-5:].any():
+        success_probability += 0.05
+    if market_volatility > 1.2:
+        success_probability += 0.05
+    success_probability = min(success_probability, 0.85)
 
     trend = "NEUTRAL"
     m15_macd_confirmed = False
@@ -292,15 +305,15 @@ def analyze(symbol, df_5m, df_15m=None, df_1h=None, expiration=1):
         return "WAIT", round(rsi_v, 2), 0, price, atr_v, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val, success_probability
 
     if adx_v < MIN_ADX:
-        reason += f"; ADX слишком низкий (< {MIN_ADX})"
+        reason += f"; ADX слишком низкий (< {MIN_ADX:.2f})"
         print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] {symbol}: {reason}")
         return "WAIT", round(rsi_v, 2), 0, price, atr_v, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val, success_probability
     if bb_width < BB_WIDTH_MIN:
-        reason += "; Узкие Bollinger Bands"
+        reason += f"; Узкие Bollinger Bands (< {BB_WIDTH_MIN:.4f})"
         print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] {symbol}: {reason}")
         return "WAIT", round(rsi_v, 2), 0, price, atr_v, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val, success_probability
     if atr_v < MIN_ATR:
-        reason += f"; ATR слишком низкий (< {MIN_ATR})"
+        reason += f"; ATR слишком низкий (< {MIN_ATR:.4f})"
         print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] {symbol}: {reason}")
         return "WAIT", round(rsi_v, 2), 0, price, atr_v, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val, success_probability
     if is_news_time():
@@ -318,31 +331,31 @@ def analyze(symbol, df_5m, df_15m=None, df_1h=None, expiration=1):
     signal_strength = 0
     reason = ""
     if rsi_v < RSI_BUY_THRESHOLD:
-        signal_strength += 1
+        signal_strength += weights['rsi']
         reason += "RSI перепродан; "
     if macd_val > signal_val + 0.005 and is_confirmed("BUY") and m15_macd_confirmed:
-        signal_strength += 2
+        signal_strength += weights['macd']
         reason += "MACD бычий (подтверждён M15); "
     if ema5_v > ema12_v and ema5.iloc[-2] <= ema12.iloc[-2]:
-        signal_strength += 2
+        signal_strength += weights['ema']
         reason += "EMA5 пересекает EMA12 вверх; "
     if stoch_v < 30:
-        signal_strength += 1
+        signal_strength += weights['stoch']
         reason += "Stochastic перепродан; "
     if price < lower_bb * 1.005:
-        signal_strength += 1
+        signal_strength += weights['bb']
         reason += "Цена ниже Bollinger; "
     if df_15m is not None and trend == "BULLISH":
-        signal_strength += 1
+        signal_strength += weights['trend']
         reason += "Бычий тренд на M15; "
-    if close.iloc[-1] > open_price and macd_val > signal_val:  # Усиление свечного паттерна
-        signal_strength += 1
+    if close.iloc[-1] > open_price and macd_val > signal_val:
+        signal_strength += weights['candle']
         reason += "Бычья свеча с MACD подтверждением; "
     if len(close) >= 3 and close.iloc[-1] > close.iloc[-2] > close.iloc[-3]:
-        signal_strength += 1
+        signal_strength += weights['price_trend']
         reason += "Рост цены последние 3 свечи; "
     if bullish_fractals.iloc[-5:].any():
-        signal_strength += 1
+        signal_strength += weights['fractal']
         reason += "Обнаружен бычий фрактал (подтверждён объёмом); "
 
     if signal_strength >= 3:
@@ -353,38 +366,38 @@ def analyze(symbol, df_5m, df_15m=None, df_1h=None, expiration=1):
             reason += f"Прогноз не подтверждает рост на {expiration} мин; "
             signal_strength -= 1
 
-        if signal_strength >= 3:  # Дополнительная проверка
-            print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] {symbol}: BUY сигнал, сила={signal_strength}, причина={reason}")
+        if signal_strength >= 3:
+            print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] {symbol}: BUY сигнал, сила={signal_strength:.2f}, причина={reason}")
             return "BUY", round(rsi_v, 2), signal_strength, price, atr_v, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val, success_probability
 
     signal_strength = 0
     reason = ""
     if rsi_v > RSI_SELL_THRESHOLD:
-        signal_strength += 1
+        signal_strength += weights['rsi']
         reason += "RSI перекуплен; "
     if macd_val < signal_val - 0.005 and is_confirmed("SELL") and m15_macd_confirmed:
-        signal_strength += 2
+        signal_strength += weights['macd']
         reason += "MACD медвежий (подтверждён M15); "
     if ema5_v < ema12_v and ema5.iloc[-2] >= ema12.iloc[-2]:
-        signal_strength += 2
+        signal_strength += weights['ema']
         reason += "EMA5 пересекает EMA12 вниз; "
     if stoch_v > 70:
-        signal_strength += 1
+        signal_strength += weights['stoch']
         reason += "Stochastic перекуплен; "
     if price > upper_bb * 0.995:
-        signal_strength += 1
+        signal_strength += weights['bb']
         reason += "Цена выше Bollinger; "
     if df_15m is not None and trend == "BEARISH":
-        signal_strength += 1
+        signal_strength += weights['trend']
         reason += "Медвежий тренд на M15; "
-    if close.iloc[-1] < open_price and macd_val < signal_val:  # Усиление свечного паттерна
-        signal_strength += 1
+    if close.iloc[-1] < open_price and macd_val < signal_val:
+        signal_strength += weights['candle']
         reason += "Медвежья свеча с MACD подтверждением; "
     if len(close) >= 3 and close.iloc[-1] < close.iloc[-2] < close.iloc[-3]:
-        signal_strength += 1
+        signal_strength += weights['price_trend']
         reason += "Падение цены последние 3 свечи; "
     if bearish_fractals.iloc[-5:].any():
-        signal_strength += 1
+        signal_strength += weights['fractal']
         reason += "Обнаружен медвежий фрактал (подтверждён объёмом); "
 
     if signal_strength >= 3:
@@ -395,8 +408,8 @@ def analyze(symbol, df_5m, df_15m=None, df_1h=None, expiration=1):
             reason += f"Прогноз не подтверждает падение на {expiration} мин; "
             signal_strength -= 1
 
-        if signal_strength >= 3:  # Дополнительная проверка
-            print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] {symbol}: SELL сигнал, сила={signal_strength}, причина={reason}")
+        if signal_strength >= 3:
+            print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] {symbol}: SELL сигнал, сила={signal_strength:.2f}, причина={reason}")
             return "SELL", round(rsi_v, 2), signal_strength, price, atr_v, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val, success_probability
 
     reason += "; Недостаточно условий для сигнала"
@@ -408,7 +421,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for attempt in range(3):
         try:
             await update.message.reply_text(
-                "Добро пожаловать в торгового бота! Прогнозы с выбранной экспирацией. Используйте кнопки ниже для выбора пары, экспирации или силы сигнала для автоанализа.",
+                "Добро пожаловать в торгового бота! Прогнозы адаптируются к рынку. Используйте кнопки для выбора пары, экспирации или силы сигнала.",
                 reply_markup=get_main_menu()
             )
             return
@@ -449,13 +462,13 @@ async def run_analysis(context: ContextTypes.DEFAULT_TYPE):
             df_1h = get_data(symbol, interval="60m", period="7d")
             signal, rsi, strength, price, atr_v, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val, success_probability = analyze(symbol, df, df_15m, df_1h, expiration)
             if signal != "WAIT":
-                print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] {symbol}: Потенциальный сигнал {signal}, сила={strength}, причина={reason}")
+                print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] {symbol}: Потенциальный сигнал {signal}, сила={strength:.2f}, причина={reason}")
                 if strength >= min_signal_strength:
                     msg = (
                         f"🚨 СИГНАЛ по {symbol.replace('=X','')}\n"
                         f"📈 Прогноз: {signal}\n"
                         f"📊 RSI: {rsi}\n"
-                        f"💪 Сила сигнала: {strength}/9\n"
+                        f"💪 Сила сигнала: {strength:.2f}/9\n"
                         f"📝 Причина: {reason}\n"
                         f"💵 Цена: {price:.4f}\n"
                         f"⏱ Таймфрейм: {DEFAULT_TIMEFRAME}\n"
@@ -468,7 +481,7 @@ async def run_analysis(context: ContextTypes.DEFAULT_TYPE):
                     else:
                         print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Не удалось отправить сигнал для {symbol}")
                 else:
-                    print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Сигнал {signal} отклонён: сила={strength} < {min_signal_strength}")
+                    print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Сигнал {signal} отклонён: сила={strength:.2f} < {min_signal_strength}")
         except Exception as e:
             print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Ошибка анализа {symbol} ({DEFAULT_TIMEFRAME}): {e}")
 
@@ -550,13 +563,13 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 df_1h = get_data(symbol, interval="60m", period="7d")
                 signal, rsi, strength, price, atr_v, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val, success_probability = analyze(symbol, df, df_15m, df_1h, expiration)
                 if signal != "WAIT":
-                    print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] {symbol}: Потенциальный сигнал {signal}, сила={strength}, причина={reason}")
+                    print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] {symbol}: Потенциальный сигнал {signal}, сила={strength:.2f}, причина={reason}")
                 if signal != "WAIT" and strength >= 3:
                     msg = (
                         f"🚨 СИГНАЛ по {symbol.replace('=X','')}\n"
                         f"📈 Прогноз: {signal}\n"
                         f"📊 RSI: {rsi}\n"
-                        f"💪 Сила сигнала: {strength}/9\n"
+                        f"💪 Сила сигнала: {strength:.2f}/9\n"
                         f"📝 Причина: {reason}\n"
                         f"💵 Цена: {price:.4f}\n"
                         f"⏱ Таймфрейм: {DEFAULT_TIMEFRAME}\n"
