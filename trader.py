@@ -33,18 +33,18 @@ RESULT_LOG_FILE = "/app/data/results_log.csv"
 MANUAL_TZ = "Africa/Algiers"
 CONFIRMATION_CANDLES = 2
 PAYOUT = 0.85
-TIMEOUT = 30
+TIMEOUT = 60
 MIN_SIGNAL_INTERVAL = 60
 VOLUME_MULTIPLIER = float('inf')
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"}
 CORRELATION_PAIRS = {
-    "EURUSD=X": ["GBPUSD=X", "AUDUSD=X"],  # Положительная корреляция
+    "EURUSD=X": ["GBPUSD=X", "AUDUSD=X"],
     "GBPUSD=X": ["EURUSD=X", "AUDUSD=X"],
     "AUDUSD=X": ["EURUSD=X", "GBPUSD=X"],
     "CADJPY=X": ["EURJPY=X", "CHFJPY=X"],
     "EURJPY=X": ["CADJPY=X", "CHFJPY=X"],
     "CHFJPY=X": ["CADJPY=X", "EURJPY=X"],
-    "USDCAD=X": []  # Обратная корреляция с USD-парами, не используем
+    "USDCAD=X": []
 }
 # =================
 
@@ -147,14 +147,14 @@ def detect_fractals(df, window=3):
             df['low'].iloc[i] < df['low'].iloc[i-2] and
             df['low'].iloc[i] < df['low'].iloc[i+1] and
             df['low'].iloc[i] < df['low'].iloc[i+2] and
-            volume.iloc[i] > avg_volume.iloc[i] * 1.1):
+            volume.iloc[i] > avg_volume.iloc[i] * 1.05):
             bullish_fractals.iloc[i] = True
         
         if (df['high'].iloc[i] > df['high'].iloc[i-1] and
             df['high'].iloc[i] > df['high'].iloc[i-2] and
             df['high'].iloc[i] > df['high'].iloc[i+1] and
             df['high'].iloc[i] > df['high'].iloc[i+2] and
-            volume.iloc[i] > avg_volume.iloc[i] * 1.1):
+            volume.iloc[i] > avg_volume.iloc[i] * 1.05):
             bearish_fractals.iloc[i] = True
     
     return bullish_fractals, bearish_fractals
@@ -193,7 +193,7 @@ def get_data(symbol, interval=DEFAULT_TIMEFRAME, period="1d"):
     print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Загружаю данные для {symbol} ({interval})")
     for attempt in range(3):
         try:
-            url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?range={'3d' if interval == '5m' else period}&interval={interval}"
+            url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?range={'3d' if interval in ['1m', '2m', '5m'] else period}&interval={interval}"
             response = session.get(url, headers=HEADERS, timeout=TIMEOUT)
             if response.status_code == 429:
                 print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Ошибка 429, жду перед повтором (попытка {attempt+1})")
@@ -228,6 +228,28 @@ def get_data(symbol, interval=DEFAULT_TIMEFRAME, period="1d"):
     print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Не удалось загрузить данные для {symbol} ({interval})")
     return None
 
+def update_outcome(symbol, entry_time, entry_price, signal, expiration):
+    try:
+        df = get_data(symbol, interval="1m", period="1h")
+        if df is None:
+            return "PENDING"
+        entry_dt = datetime.strptime(entry_time, "%H:%M:%S").replace(
+            year=datetime.now(LOCAL_TZ).year,
+            month=datetime.now(LOCAL_TZ).month,
+            day=datetime.now(LOCAL_TZ).day,
+            tzinfo=LOCAL_TZ
+        )
+        end_time = entry_dt + timedelta(minutes=expiration)
+        future_data = df[df['timestamp'] <= end_time.strftime("%Y-%m-%d %H:%M:%S")]
+        if signal == "BUY" and any(future_data['high'] >= entry_price * (1.0001 + 0.0001 * expiration)):
+            return "WIN"
+        elif signal == "SELL" and any(future_data['low'] <= entry_price * (0.9999 - 0.0001 * expiration)):
+            return "WIN"
+        return "LOSS"
+    except Exception as e:
+        print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Ошибка обновления исхода для {symbol}: {e}")
+        return "PENDING"
+
 def analyze(symbol, df_5m, df_15m=None, df_1h=None, expiration=1):
     print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Анализирую {symbol} для прогноза с экспирацией {expiration} мин...")
     if len(df_5m) < 30:
@@ -241,14 +263,14 @@ def analyze(symbol, df_5m, df_15m=None, df_1h=None, expiration=1):
     open = df_5m['open']
     volume = df_5m['volume']
     
-    rsi = RSIIndicator(close, window=14).rsi()
+    rsi_window = 7 if expiration == 1 else 10 if expiration == 2 else 14
+    rsi = RSIIndicator(close, window=rsi_window).rsi()
     macd = MACD(close, window_slow=26, window_fast=12, window_sign=9)
     bb = BollingerBands(close, window=20, window_dev=2)
     ema5 = EMAIndicator(close, window=5).ema_indicator()
     ema12 = EMAIndicator(close, window=12).ema_indicator()
-    ema26 = EMAIndicator(close, window=26).ema_indicator()
     adx = ADXIndicator(high=high, low=low, close=close, window=14).adx()
-    stochastic = StochasticOscillator(close=close, high=high, low=low, window=14, smooth_window=3).stoch()
+    stochastic = StochasticOscillator(close=close, high=high, low=low, window=rsi_window, smooth_window=3).stoch()
     atr = AverageTrueRange(high=high, low=low, close=close, window=14).average_true_range()
 
     bullish_fractals, bearish_fractals = detect_fractals(df_5m)
@@ -259,7 +281,6 @@ def analyze(symbol, df_5m, df_15m=None, df_1h=None, expiration=1):
     signal_val = macd.macd_signal().iloc[-1]
     ema5_v = ema5.iloc[-1]
     ema12_v = ema12.iloc[-1]
-    ema26_v = ema26.iloc[-1]
     adx_v = adx.iloc[-1]
     stoch_v = stochastic.iloc[-1]
     price = close.iloc[-1]
@@ -285,13 +306,13 @@ def analyze(symbol, df_5m, df_15m=None, df_1h=None, expiration=1):
     rsi_std = rsi[-10:].std()
     adx_mean = adx[-10:].mean()
     
-    RSI_BUY_THRESHOLD = max(25, rsi_mean - rsi_std * (1 - 0.4 * market_volatility))  # Увеличена чувствительность
-    RSI_SELL_THRESHOLD = min(75, rsi_mean + rsi_std * (1 - 0.4 * market_volatility))  # Увеличена чувствительность
-    STOCH_BUY_THRESHOLD = max(20, 30 - 10 * (1 - market_volatility))  # Динамический порог
-    STOCH_SELL_THRESHOLD = min(80, 70 + 10 * (1 - market_volatility))  # Динамический порог
+    RSI_BUY_THRESHOLD = max(20, rsi_mean - rsi_std * (1 - 0.4 * market_volatility))
+    RSI_SELL_THRESHOLD = min(80, rsi_mean + rsi_std * (1 - 0.4 * market_volatility))
+    STOCH_BUY_THRESHOLD = max(15, 20 - 5 * (1 - market_volatility))
+    STOCH_SELL_THRESHOLD = min(85, 80 + 5 * (1 - market_volatility))
     MIN_ADX = max(12, adx_mean * 0.6 * (1 - 0.3 * trend_strength))
-    BB_WIDTH_MIN = max(0.0003, bb_width_mean * 0.4 * (1 + 0.3 * market_volatility))
-    MIN_ATR = atr_mean * 0.5 * (1 - 0.2 * market_volatility)
+    BB_WIDTH_MIN = max(0.0002, bb_width_mean * 0.3 * (1 + 0.3 * market_volatility))
+    MIN_ATR = atr_mean * 0.4 * (1 - 0.2 * market_volatility)
 
     print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] {symbol}: market_volatility={market_volatility:.2f}, trend_strength={trend_strength:.2f}, MIN_ADX={MIN_ADX:.2f}, BB_WIDTH_MIN={BB_WIDTH_MIN:.4f}")
 
@@ -307,7 +328,7 @@ def analyze(symbol, df_5m, df_15m=None, df_1h=None, expiration=1):
         'price_trend': 1.0,
         'fractal': 1.2 + 0.3 * market_volatility,
         'volume': 1.0,
-        'correlation': 1.2  # Новый вес для корреляции
+        'correlation': 1.2
     }
     print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Адаптивные веса: {weights}")
 
@@ -435,9 +456,10 @@ def analyze(symbol, df_5m, df_15m=None, df_1h=None, expiration=1):
     if corr_confirmed:
         signal_strength += weights['correlation']
         reason += corr_reason
+        success_probability += 0.05
 
     if signal_strength >= 3:
-        if price_high > price * 1.0002:
+        if price_high > price * (1.0001 + 0.0001 * expiration):
             signal_strength += 1
             reason += f"Прогноз роста на {expiration} мин; "
         else:
@@ -489,9 +511,10 @@ def analyze(symbol, df_5m, df_15m=None, df_1h=None, expiration=1):
     if corr_confirmed:
         signal_strength += weights['correlation']
         reason += corr_reason
+        success_probability += 0.05
 
     if signal_strength >= 3:
-        if price_low < price * 0.9998:
+        if price_low < price * (0.9999 - 0.0001 * expiration):
             signal_strength += 1
             reason += f"Прогноз падения на {expiration} мин; "
         else:
@@ -533,11 +556,12 @@ async def run_analysis(context: ContextTypes.DEFAULT_TYPE):
         print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Нет интернета, пропускаю анализ")
         return
     print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Запуск автоматического анализа")
-    expiration = 1
+    expiration = context.bot_data.get('expiration', 1)
     min_signal_strength = context.bot_data.get('auto_signal_strength', 3)
     print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Минимальная сила сигнала для автоанализа: {min_signal_strength}")
+    df_results = pd.read_csv(RESULT_LOG_FILE) if os.path.exists(RESULT_LOG_FILE) else pd.DataFrame()
     for symbol in SYMBOLS:
-        print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Анализ {symbol} на таймфрейме {DEFAULT_TIMEFRAME} с экспирацией 1 мин")
+        print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Анализ {symbol} на таймфрейме {DEFAULT_TIMEFRAME} с экспирацией {expiration} мин")
         try:
             if last_signal_time[symbol] is not None:
                 time_since_last = (datetime.now(LOCAL_TZ) - last_signal_time[symbol]).total_seconds()
@@ -555,22 +579,29 @@ async def run_analysis(context: ContextTypes.DEFAULT_TYPE):
             if signal != "WAIT":
                 print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] {symbol}: Потенциальный сигнал {signal}, сила={strength:.2f}, причина={reason}")
                 if strength >= min_signal_strength:
+                    entry_time = datetime.now(LOCAL_TZ).strftime("%H:%M:%S")
+                    outcome = update_outcome(symbol, entry_time, price, signal, expiration)
                     msg = (
                         f"🚨 СИГНАЛ по {symbol.replace('=X','')}\n"
                         f"📈 Прогноз: {signal}\n"
                         f"📊 RSI: {rsi}\n"
-                        f"💪 Сила сигнала: {strength:.2f}/11\n"  # Учитываем correlation
+                        f"💪 Сила сигнала: {strength:.2f}/11\n"
                         f"📝 Причина: {reason}\n"
                         f"💵 Цена: {price:.4f}\n"
                         f"⏱ Таймфрейм: {DEFAULT_TIMEFRAME}\n"
                         f"⏰ Прогноз на {expiration} мин\n"
                         f"🎯 Вероятность: {success_probability:.2%}"
                     )
-                    log_result(symbol.replace('=X',''), signal, rsi, datetime.now(LOCAL_TZ).strftime("%H:%M:%S"), reason, rsi_v, adx_v, stoch_v, macd_val, signal_val, atr_v, price, 0.0, success_probability)
+                    log_result(symbol.replace('=X',''), signal, rsi, entry_time, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val, atr_v, price, 0.0, success_probability, outcome)
                     if send_telegram_message(msg, symbol):
                         last_signal_time[symbol] = datetime.now(LOCAL_TZ)
                     else:
                         print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Не удалось отправить сигнал для {symbol}")
+                    # Промежуточный отчёт
+                    df_results = pd.read_csv(RESULT_LOG_FILE)
+                    if len(df_results[df_results['Outcome'].isin(['WIN', 'LOSS'])]) % 10 == 0:
+                        win_rate = len(df_results[df_results['Outcome'] == 'WIN']) / len(df_results[df_results['Outcome'].isin(['WIN', 'LOSS'])])
+                        send_telegram_message(f"Промежуточный результат: Win Rate = {win_rate:.2%}, Сигналов = {len(df_results)}")
                 else:
                     print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Сигнал {signal} отклонён: сила={strength:.2f} < {min_signal_strength}")
         except Exception as e:
@@ -657,6 +688,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if signal != "WAIT":
                     print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] {symbol}: Потенциальный сигнал {signal}, сила={strength:.2f}, причина={reason}")
                 if signal != "WAIT" and strength >= 3:
+                    entry_time = datetime.now(LOCAL_TZ).strftime("%H:%M:%S")
+                    outcome = update_outcome(symbol, entry_time, price, signal, expiration)
                     msg = (
                         f"🚨 СИГНАЛ по {symbol.replace('=X','')}\n"
                         f"📈 Прогноз: {signal}\n"
@@ -668,7 +701,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         f"⏰ Прогноз на {expiration} мин\n"
                         f"🎯 Вероятность: {success_probability:.2%}"
                     )
-                    log_result(symbol.replace('=X',''), signal, rsi, datetime.now(LOCAL_TZ).strftime("%H:%M:%S"), reason, rsi_v, adx_v, stoch_v, macd_val, signal_val, atr_v, price, 0.0, success_probability)
+                    log_result(symbol.replace('=X',''), signal, rsi, entry_time, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val, atr_v, price, 0.0, success_probability, outcome)
                     if send_telegram_message(msg, symbol):
                         last_signal_time[symbol] = datetime.now(LOCAL_TZ)
                 else:
