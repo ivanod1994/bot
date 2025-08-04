@@ -138,14 +138,14 @@ def detect_fractals(df, window=3):
             df['low'].iloc[i] < df['low'].iloc[i-2] and
             df['low'].iloc[i] < df['low'].iloc[i+1] and
             df['low'].iloc[i] < df['low'].iloc[i+2] and
-            volume.iloc[i] > avg_volume.iloc[i] * 1.2):
+            volume.iloc[i] > avg_volume.iloc[i] * 1.1):  # Снижено с 1.2
             bullish_fractals.iloc[i] = True
         
         if (df['high'].iloc[i] > df['high'].iloc[i-1] and
             df['high'].iloc[i] > df['high'].iloc[i-2] and
             df['high'].iloc[i] > df['high'].iloc[i+1] and
             df['high'].iloc[i] > df['high'].iloc[i+2] and
-            volume.iloc[i] > avg_volume.iloc[i] * 1.2):
+            volume.iloc[i] > avg_volume.iloc[i] * 1.1):  # Снижено с 1.2
             bearish_fractals.iloc[i] = True
     
     return bullish_fractals, bearish_fractals
@@ -253,7 +253,7 @@ def analyze(symbol, df_5m, df_15m=None, df_1h=None, expiration=1):
     
     RSI_BUY_THRESHOLD = max(30, rsi_mean - rsi_std * (1 - 0.3 * market_volatility))
     RSI_SELL_THRESHOLD = min(70, rsi_mean + rsi_std * (1 - 0.3 * market_volatility))
-    MIN_ADX = max(12, adx_mean * 0.6 * (1 - 0.3 * trend_strength))  # Снижено с 15 до 12
+    MIN_ADX = max(12, adx_mean * 0.6 * (1 - 0.3 * trend_strength))
     BB_WIDTH_MIN = max(0.0003, bb_width_mean * 0.4 * (1 + 0.3 * market_volatility))
     MIN_ATR = atr_mean * 0.5 * (1 - 0.2 * market_volatility)
 
@@ -262,14 +262,15 @@ def analyze(symbol, df_5m, df_15m=None, df_1h=None, expiration=1):
     # Адаптивные веса условий
     weights = {
         'rsi': 1.0 + 0.3 * (1 - trend_strength),
-        'macd': 2.0 + 0.4 * market_volatility,
+        'macd': 2.5 + 0.4 * market_volatility,  # Увеличен вес
         'ema': 2.0,
         'stoch': 1.0 + 0.3 * (1 - trend_strength),
         'bb': 1.0,
-        'trend': 1.5 + 0.3 * (1 - trend_strength),  # Увеличен вес тренда M15
+        'trend': 1.5 + 0.3 * (1 - trend_strength),
         'candle': 1.0,
         'price_trend': 1.0,
-        'fractal': 1.2 + 0.3 * market_volatility
+        'fractal': 1.2 + 0.3 * market_volatility,
+        'volume': 1.0  # Новый вес
     }
     print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Адаптивные веса: {weights}")
 
@@ -308,11 +309,11 @@ def analyze(symbol, df_5m, df_15m=None, df_1h=None, expiration=1):
               f"Signal: {signal_val:.4f}, ATR: {atr_v:.4f}, BB_Width: {bb_width:.4f}, Trend M15: {trend}, "
               f"Expected Move: ±{expected_move:.4f}, Success Probability: {success_probability:.2%}")
 
-    # Фильтр низкой волатильности
-    if atr_v < atr_historical * 0.8:
-        reason += "; Низкая текущая волатильность (ATR ниже исторического)"
-        print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] {symbol}: {reason}")
-        return "WAIT", round(rsi_v, 2), 0, price, atr_v, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val, success_probability
+    # Фильтры
+    # if atr_v < atr_historical * 0.8:
+    #     reason += "; Низкая текущая волатильность (ATR ниже исторического)"
+    #     print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] {symbol}: {reason}")
+    #     return "WAIT", round(rsi_v, 2), 0, price, atr_v, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val, success_probability
 
     if adx_v < MIN_ADX:
         reason += f"; ADX слишком низкий (< {MIN_ADX:.2f})"
@@ -337,6 +338,9 @@ def analyze(symbol, df_5m, df_15m=None, df_1h=None, expiration=1):
         elif signal_type == "SELL":
             return all(macd.macd().iloc[-i] < macd.macd_signal().iloc[-i] for i in range(1, candles + 1))
         return False
+
+    # Проверка роста объёма
+    volume_trend = volume.iloc[-1] > volume[-10:].mean() * 1.2
 
     signal_strength = 0
     reason = ""
@@ -367,9 +371,12 @@ def analyze(symbol, df_5m, df_15m=None, df_1h=None, expiration=1):
     if bullish_fractals.iloc[-5:].any():
         signal_strength += weights['fractal']
         reason += "Обнаружен бычий фрактал (подтверждён объёмом); "
+    if volume_trend:
+        signal_strength += weights['volume']
+        reason += "Рост объёма; "
 
     if signal_strength >= 3:
-        if price_high > price * 1.0003:
+        if price_high > price * 1.0002:  # Снижено с 1.0003
             signal_strength += 1
             reason += f"Прогноз роста на {expiration} мин; "
         else:
@@ -409,9 +416,12 @@ def analyze(symbol, df_5m, df_15m=None, df_1h=None, expiration=1):
     if bearish_fractals.iloc[-5:].any():
         signal_strength += weights['fractal']
         reason += "Обнаружен медвежий фрактал (подтверждён объёмом); "
+    if volume_trend:
+        signal_strength += weights['volume']
+        reason += "Рост объёма; "
 
     if signal_strength >= 3:
-        if price_low < price * 0.9997:
+        if price_low < price * 0.9998:  # Снижено с 0.9997
             signal_strength += 1
             reason += f"Прогноз падения на {expiration} мин; "
         else:
@@ -479,7 +489,7 @@ async def run_analysis(context: ContextTypes.DEFAULT_TYPE):
                         f"🚨 СИГНАЛ по {symbol.replace('=X','')}\n"
                         f"📈 Прогноз: {signal}\n"
                         f"📊 RSI: {rsi}\n"
-                        f"💪 Сила сигнала: {strength:.2f}/9\n"
+                        f"💪 Сила сигнала: {strength:.2f}/10\n"  # Учитываем новый вес volume
                         f"📝 Причина: {reason}\n"
                         f"💵 Цена: {price:.4f}\n"
                         f"⏱ Таймфрейм: {DEFAULT_TIMEFRAME}\n"
@@ -519,7 +529,7 @@ def get_expiration_menu():
 
 def get_signal_strength_menu():
     strengths = [3, 4, 5]
-    keyboard = [[InlineKeyboardButton(f"Сила {strength}/9", callback_data=f'signal_strength_{strength}')] for strength in strengths]
+    keyboard = [[InlineKeyboardButton(f"Сила {strength}/10", callback_data=f'signal_strength_{strength}')] for strength in strengths]  # Учитываем новый вес volume
     keyboard.append([InlineKeyboardButton("Назад", callback_data='back_to_main')])
     return InlineKeyboardMarkup(keyboard)
 
@@ -557,7 +567,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             elif data.startswith('signal_strength_'):
                 strength = int(data.split('_')[2])
                 context.bot_data['auto_signal_strength'] = strength
-                await query.message.edit_text(f"Выбрана минимальная сила сигнала для автоанализа: {strength}/9\nВыберите действие:", reply_markup=get_main_menu())
+                await query.message.edit_text(f"Выбрана минимальная сила сигнала для автоанализа: {strength}/10\nВыберите действие:", reply_markup=get_main_menu())
                 return
             elif data == 'get_signal':
                 if chat_id not in user_selections or 'symbol' not in user_selections[chat_id] or 'expiration' not in user_selections[chat_id]:
@@ -581,7 +591,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         f"🚨 СИГНАЛ по {symbol.replace('=X','')}\n"
                         f"📈 Прогноз: {signal}\n"
                         f"📊 RSI: {rsi}\n"
-                        f"💪 Сила сигнала: {strength:.2f}/9\n"
+                        f"💪 Сила сигнала: {strength:.2f}/10\n"
                         f"📝 Причина: {reason}\n"
                         f"💵 Цена: {price:.4f}\n"
                         f"⏱ Таймфрейм: {DEFAULT_TIMEFRAME}\n"
@@ -637,7 +647,7 @@ def main():
         application.job_queue.scheduler.configure(timezone=LOCAL_TZ)
         application.add_handler(CommandHandler("start", start))
         application.add_handler(CallbackQueryHandler(button_callback))
-        application.job_queue.run_repeating(run_analysis, interval=120, first=10)  # Увеличен интервал до 120 секунд
+        application.job_queue.run_repeating(run_analysis, interval=90, first=10)
         send_telegram_message("Бот успешно запущен и начал анализ рынка!")
         print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Бот запущен, ожидает команды...")
         application.run_polling()
