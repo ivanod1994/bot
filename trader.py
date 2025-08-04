@@ -160,7 +160,7 @@ def get_data(symbol, interval=DEFAULT_TIMEFRAME, period="1d"):
     for attempt in range(3):
         try:
             url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?range={'3d' if interval == '5m' else period}&interval={interval}"
-            response = session.get(url, headers=HEADERS, timeout=TIMOUT)
+            response = session.get(url, headers=HEADERS, timeout=TIMEOUT)  # Исправлено: TIMOUT → TIMEOUT
             if response.status_code == 429:
                 print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Ошибка 429, жду перед повтором (попытка {attempt+1})")
                 time.sleep(20 ** attempt)
@@ -253,21 +253,23 @@ def analyze(symbol, df_5m, df_15m=None, df_1h=None, expiration=1):
     
     RSI_BUY_THRESHOLD = max(30, rsi_mean - rsi_std * (1 - 0.3 * market_volatility))
     RSI_SELL_THRESHOLD = min(70, rsi_mean + rsi_std * (1 - 0.3 * market_volatility))
-    MIN_ADX = max(15, adx_mean * 0.6 * (1 - 0.3 * trend_strength))  # Снижен базовый порог до 15
-    BB_WIDTH_MIN = max(0.0003, bb_width_mean * 0.4 * (1 + 0.3 * market_volatility))  # Снижен до 0.0003
+    MIN_ADX = max(15, adx_mean * 0.6 * (1 - 0.3 * trend_strength))
+    BB_WIDTH_MIN = max(0.0003, bb_width_mean * 0.4 * (1 + 0.3 * market_volatility))
     MIN_ATR = atr_mean * 0.5 * (1 - 0.2 * market_volatility)
+
+    print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] {symbol}: market_volatility={market_volatility:.2f}, trend_strength={trend_strength:.2f}, MIN_ADX={MIN_ADX:.2f}, BB_WIDTH_MIN={BB_WIDTH_MIN:.4f}")
 
     # Адаптивные веса условий
     weights = {
-        'rsi': 1.0 + 0.3 * (1 - trend_strength),  # Увеличен вес при слабом тренде
-        'macd': 2.0 + 0.4 * market_volatility,   # Увеличен вес при высокой волатильности
+        'rsi': 1.0 + 0.3 * (1 - trend_strength),
+        'macd': 2.0 + 0.4 * market_volatility,
         'ema': 2.0,
-        'stoch': 1.0 + 0.3 * (1 - trend_strength),  # Увеличен вес при слабом тренде
+        'stoch': 1.0 + 0.3 * (1 - trend_strength),
         'bb': 1.0,
-        'trend': 1.2 + 0.2 * (1 - trend_strength),  # Увеличен вес тренда M15
+        'trend': 1.2 + 0.2 * (1 - trend_strength),
         'candle': 1.0,
         'price_trend': 1.0,
-        'fractal': 1.2 + 0.3 * market_volatility  # Увеличен вес фракталов
+        'fractal': 1.2 + 0.3 * market_volatility
     }
     print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Адаптивные веса: {weights}")
 
@@ -282,7 +284,7 @@ def analyze(symbol, df_5m, df_15m=None, df_1h=None, expiration=1):
     if market_volatility > 1.2:
         success_probability += 0.05
     if df_15m is not None and trend in ["BULLISH", "BEARISH"]:
-        success_probability += 0.10  # Бонус за тренд на M15
+        success_probability += 0.10
     success_probability = min(success_probability, 0.85)
 
     trend = "NEUTRAL"
@@ -627,7 +629,7 @@ def main():
         application.job_queue.scheduler.configure(timezone=LOCAL_TZ)
         application.add_handler(CommandHandler("start", start))
         application.add_handler(CallbackQueryHandler(button_callback))
-        application.job_queue.run_repeating(run_analysis, interval=60, first=10)
+        application.job_queue.run_repeating(run_analysis, interval=90, first=10)  # Увеличен интервал до 90 секунд
         send_telegram_message("Бот успешно запущен и начал анализ рынка!")
         print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Бот запущен, ожидает команды...")
         application.run_polling()
