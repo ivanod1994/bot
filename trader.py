@@ -126,26 +126,30 @@ def send_telegram_message(msg, symbol="Unknown"):
 
 def detect_fractals(df, window=3):
     """
-    Определяет бычьи и медвежьи фракталы на основе 5-свечной формации.
-    Возвращает два Series: bullish_fractals и bearish_fractals (True, если фрактал найден).
+    Определяет бычьи и медвежьи фракталы с учётом объёма.
+    Возвращает два Series: bullish_fractals и bearish_fractals (True, если фрактал подтверждён).
     """
     if len(df) < 5:
         return pd.Series(False, index=df.index), pd.Series(False, index=df.index)
     
     bullish_fractals = pd.Series(False, index=df.index)
     bearish_fractals = pd.Series(False, index=df.index)
-    
+    volume = df['volume']
+    avg_volume = volume.rolling(window=10).mean()
+
     for i in range(window, len(df) - window):
         if (df['low'].iloc[i] < df['low'].iloc[i-1] and
             df['low'].iloc[i] < df['low'].iloc[i-2] and
             df['low'].iloc[i] < df['low'].iloc[i+1] and
-            df['low'].iloc[i] < df['low'].iloc[i+2]):
+            df['low'].iloc[i] < df['low'].iloc[i+2] and
+            volume.iloc[i] > avg_volume.iloc[i] * 1.2):  # Объём выше среднего
             bullish_fractals.iloc[i] = True
         
         if (df['high'].iloc[i] > df['high'].iloc[i-1] and
             df['high'].iloc[i] > df['high'].iloc[i-2] and
             df['high'].iloc[i] > df['high'].iloc[i+1] and
-            df['high'].iloc[i] > df['high'].iloc[i+2]):
+            df['high'].iloc[i] > df['high'].iloc[i+2] and
+            volume.iloc[i] > avg_volume.iloc[i] * 1.2):  # Объём выше среднего
             bearish_fractals.iloc[i] = True
     
     return bullish_fractals, bearish_fractals
@@ -205,6 +209,7 @@ def analyze(symbol, df_5m, df_15m=None, df_1h=None, expiration=1):
     high = df_5m['high']
     low = df_5m['low']
     open = df_5m['open']
+    volume = df_5m['volume']
     
     rsi = RSIIndicator(close, window=14).rsi()
     macd = MACD(close, window_slow=26, window_fast=12, window_sign=9)
@@ -235,10 +240,20 @@ def analyze(symbol, df_5m, df_15m=None, df_1h=None, expiration=1):
     bb_width = (upper_bb - lower_bb) / price
 
     atr_mean = atr[-10:].mean()
+    atr_historical = atr[-20:].mean()  # Исторический ATR для фильтрации
     expected_move = atr_mean * (expiration / 5.0)
     price_high = price + expected_move
     price_low = price - expected_move
-    success_probability = 0.65
+
+    # Динамическая вероятность успеха
+    success_probability = 0.50  # Базовая вероятность
+    if adx_v > 25:
+        success_probability += 0.15  # Сильный тренд
+    if bb_width > bb_width_mean * 1.2:
+        success_probability += 0.10  # Высокая волатильность
+    if bullish_fractals.iloc[-5:].any() or bearish_fractals.iloc[-5:].any():
+        success_probability += 0.05  # Подтверждённый фрактал
+    success_probability = min(success_probability, 0.85)  # Ограничение до 85%
 
     rsi_mean = rsi[-10:].mean()
     rsi_std = rsi[-10:].std()
@@ -254,14 +269,25 @@ def analyze(symbol, df_5m, df_15m=None, df_1h=None, expiration=1):
     MIN_ATR = atr_mean * 0.5
 
     trend = "NEUTRAL"
+    m15_macd_confirmed = False
     if df_15m is not None:
         ema5_m15 = EMAIndicator(df_15m['close'], window=5).ema_indicator().iloc[-1]
         ema12_m15 = EMAIndicator(df_15m['close'], window=12).ema_indicator().iloc[-1]
+        macd_m15 = MACD(df_15m['close'], window_slow=26, window_fast=12, window_sign=9)
+        macd_m15_val = macd_m15.macd().iloc[-1]
+        signal_m15_val = macd_m15.macd_signal().iloc[-1]
         trend = "BULLISH" if ema5_m15 > ema12_m15 else "BEARISH" if ema5_m15 < ema12_m15 else "NEUTRAL"
+        m15_macd_confirmed = (macd_m15_val > signal_m15_val) if trend == "BULLISH" else (macd_m15_val < signal_m15_val) if trend == "BEARISH" else False
 
     reason = (f"RSI: {rsi_v:.2f}, ADX: {adx_v:.2f}, Stochastic: {stoch_v:.2f}, MACD: {macd_val:.4f}, "
               f"Signal: {signal_val:.4f}, ATR: {atr_v:.4f}, BB_Width: {bb_width:.4f}, Trend M15: {trend}, "
               f"Expected Move: ±{expected_move:.4f}, Success Probability: {success_probability:.2%}")
+
+    # Фильтр низкой волатильности
+    if atr_v < atr_historical * 0.8:
+        reason += "; Низкая текущая волатильность (ATR ниже исторического)"
+        print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] {symbol}: {reason}")
+        return "WAIT", round(rsi_v, 2), 0, price, atr_v, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val, success_probability
 
     if adx_v < MIN_ADX:
         reason += f"; ADX слишком низкий (< {MIN_ADX})"
@@ -292,9 +318,9 @@ def analyze(symbol, df_5m, df_15m=None, df_1h=None, expiration=1):
     if rsi_v < RSI_BUY_THRESHOLD:
         signal_strength += 1
         reason += "RSI перепродан; "
-    if macd_val > signal_val + 0.005 and is_confirmed("BUY"):
+    if macd_val > signal_val + 0.005 and is_confirmed("BUY") and m15_macd_confirmed:
         signal_strength += 2
-        reason += "MACD бычий; "
+        reason += "MACD бычий (подтверждён M15); "
     if ema5_v > ema12_v and ema5.iloc[-2] <= ema12.iloc[-2]:
         signal_strength += 2
         reason += "EMA5 пересекает EMA12 вверх; "
@@ -307,15 +333,15 @@ def analyze(symbol, df_5m, df_15m=None, df_1h=None, expiration=1):
     if df_15m is not None and trend == "BULLISH":
         signal_strength += 1
         reason += "Бычий тренд на M15; "
-    if close.iloc[-1] > open_price:
+    if close.iloc[-1] > open_price and macd_val > signal_val:  # Усиление свечного паттерна
         signal_strength += 1
-        reason += "Бычья свеча; "
+        reason += "Бычья свеча с MACD подтверждением; "
     if len(close) >= 3 and close.iloc[-1] > close.iloc[-2] > close.iloc[-3]:
         signal_strength += 1
         reason += "Рост цены последние 3 свечи; "
     if bullish_fractals.iloc[-5:].any():
         signal_strength += 1
-        reason += "Обнаружен бычий фрактал; "
+        reason += "Обнаружен бычий фрактал (подтверждён объёмом); "
 
     if signal_strength >= 3:
         if price_high > price * 1.0003:
@@ -325,17 +351,18 @@ def analyze(symbol, df_5m, df_15m=None, df_1h=None, expiration=1):
             reason += f"Прогноз не подтверждает рост на {expiration} мин; "
             signal_strength -= 1
 
-        print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] {symbol}: BUY сигнал, сила={signal_strength}, причина={reason}")
-        return "BUY", round(rsi_v, 2), signal_strength, price, atr_v, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val, success_probability
+        if signal_strength >= 3:  # Дополнительная проверка
+            print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] {symbol}: BUY сигнал, сила={signal_strength}, причина={reason}")
+            return "BUY", round(rsi_v, 2), signal_strength, price, atr_v, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val, success_probability
 
     signal_strength = 0
     reason = ""
     if rsi_v > RSI_SELL_THRESHOLD:
         signal_strength += 1
         reason += "RSI перекуплен; "
-    if macd_val < signal_val - 0.005 and is_confirmed("SELL"):
+    if macd_val < signal_val - 0.005 and is_confirmed("SELL") and m15_macd_confirmed:
         signal_strength += 2
-        reason += "MACD медвежий; "
+        reason += "MACD медвежий (подтверждён M15); "
     if ema5_v < ema12_v and ema5.iloc[-2] >= ema12.iloc[-2]:
         signal_strength += 2
         reason += "EMA5 пересекает EMA12 вниз; "
@@ -348,15 +375,15 @@ def analyze(symbol, df_5m, df_15m=None, df_1h=None, expiration=1):
     if df_15m is not None and trend == "BEARISH":
         signal_strength += 1
         reason += "Медвежий тренд на M15; "
-    if close.iloc[-1] < open_price:
+    if close.iloc[-1] < open_price and macd_val < signal_val:  # Усиление свечного паттерна
         signal_strength += 1
-        reason += "Медвежья свеча; "
+        reason += "Медвежья свеча с MACD подтверждением; "
     if len(close) >= 3 and close.iloc[-1] < close.iloc[-2] < close.iloc[-3]:
         signal_strength += 1
         reason += "Падение цены последние 3 свечи; "
     if bearish_fractals.iloc[-5:].any():
         signal_strength += 1
-        reason += "Обнаружен медвежий фрактал; "
+        reason += "Обнаружен медвежий фрактал (подтверждён объёмом); "
 
     if signal_strength >= 3:
         if price_low < price * 0.9997:
@@ -366,8 +393,9 @@ def analyze(symbol, df_5m, df_15m=None, df_1h=None, expiration=1):
             reason += f"Прогноз не подтверждает падение на {expiration} мин; "
             signal_strength -= 1
 
-        print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] {symbol}: SELL сигнал, сила={signal_strength}, причина={reason}")
-        return "SELL", round(rsi_v, 2), signal_strength, price, atr_v, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val, success_probability
+        if signal_strength >= 3:  # Дополнительная проверка
+            print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] {symbol}: SELL сигнал, сила={signal_strength}, причина={reason}")
+            return "SELL", round(rsi_v, 2), signal_strength, price, atr_v, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val, success_probability
 
     reason += "; Недостаточно условий для сигнала"
     print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] {symbol}: {reason}")
