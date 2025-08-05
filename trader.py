@@ -48,9 +48,9 @@ CORRELATION_PAIRS = {
 }
 ACCOUNT_BALANCE = 10000
 RISK_PER_TRADE = 0.005
-MIN_SUCCESS_PROBABILITY = 0.65
+MIN_SUCCESS_PROBABILITY = 0.60  # Снижено с 0.65
 MIN_SIGNAL_STRENGTH = 4.0
-MAX_ACTIVE_TRADES = 3
+MAX_ACTIVE_TRADES = 5  # Увеличено с 3
 MIN_REWARD_RISK_RATIO = 1.2
 CSV_COLUMNS = ["Entry_Time", "Symbol", "Signal", "Entry_Price", "Stop_Loss", "Take_Profit", "Lot_Size", "Reason", "Success_Probability", "Outcome", "Exit_Price", "Profit"]
 # =================
@@ -268,9 +268,11 @@ def clean_csv_file(file_path):
     print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Файл {file_path} очищен")
 
 def update_outcome(symbol, entry_time, entry_price, signal, expiration, stop_loss, take_profit):
+    print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Обновление исхода для {symbol}, Entry_Time: {entry_time}")
     try:
         df = get_data(symbol, interval="1m", period="1h")
         if df is None:
+            print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Не удалось загрузить данные для {symbol} в update_outcome")
             return "PENDING", entry_price
         entry_dt = datetime.strptime(entry_time, "%H:%M:%S").replace(
             year=datetime.now(LOCAL_TZ).year,
@@ -280,24 +282,38 @@ def update_outcome(symbol, entry_time, entry_price, signal, expiration, stop_los
         )
         end_time = entry_dt + timedelta(minutes=expiration)
         future_data = df[df['timestamp'] <= end_time.strftime("%Y-%m-%d %H:%M:%S")]
+        print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] {symbol}: Данные для проверки исхода: {len(future_data)} свечей, End Time: {end_time}")
         if signal == "BUY":
             if any(future_data['high'] >= take_profit):
+                print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] {symbol}: Достигнут Take Profit: {take_profit}")
                 return "WIN", take_profit
             elif any(future_data['low'] <= stop_loss):
+                print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] {symbol}: Достигнут Stop Loss: {stop_loss}")
                 return "LOSS", stop_loss
             elif any(future_data['high'] >= entry_price * (1.00005 + 0.00003 * expiration)):
-                return "WIN", future_data['high'].max()
+                max_high = future_data['high'].max()
+                print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] {symbol}: Достигнут минимальный профит: {max_high}")
+                return "WIN", max_high
             elif any(future_data['low'] <= entry_price * (0.99995 - 0.00003 * expiration)):
-                return "LOSS", future_data['low'].min()
+                min_low = future_data['low'].min()
+                print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] {symbol}: Достигнут минимальный убыток: {min_low}")
+                return "LOSS", min_low
         elif signal == "SELL":
             if any(future_data['low'] <= take_profit):
+                print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] {symbol}: Достигнут Take Profit: {take_profit}")
                 return "WIN", take_profit
             elif any(future_data['high'] >= stop_loss):
+                print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] {symbol}: Достигнут Stop Loss: {stop_loss}")
                 return "LOSS", stop_loss
             elif any(future_data['low'] <= entry_price * (0.99995 - 0.00003 * expiration)):
-                return "WIN", future_data['low'].min()
+                min_low = future_data['low'].min()
+                print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] {symbol}: Достигнут минимальный профит: {min_low}")
+                return "WIN", min_low
             elif any(future_data['high'] >= entry_price * (1.00005 + 0.00003 * expiration)):
-                return "LOSS", future_data['high'].max()
+                max_high = future_data['high'].max()
+                print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] {symbol}: Достигнут минимальный убыток: {max_high}")
+                return "LOSS", max_high
+        print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] {symbol}: Сделка остаётся PENDING")
         return "PENDING", entry_price
     except Exception as e:
         print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Ошибка обновления исхода для {symbol}: {e}")
@@ -446,12 +462,9 @@ def analyze(symbol, df_5m, df_15m=None, df_1h=None, expiration=1):
         success_probability = min(success_probability, 0.90)
 
         # Формирование базовой причины
-        reason = (f"RSI: {rsi_v:.2f}, ADX: {adx_v:.2f}, Stochastic: {stoch_v:.2f}, MACD: {macd_val:.4f}, "
-                  f"Signal: {signal_val:.4f}, ATR: {atr_v:.4f}, BB_Width: {bb_width:.4f}, Trend M15: {trend_m15}, "
-                  f"Trend H1: {trend_h1}, Expected Move: ±{expected_move:.4f}, Success Probability: {success_probability:.2%}")
-
-        # Экранирование запятых в reason
-        reason = reason.replace(',', ';')
+        reason = (f"RSI: {rsi_v:.2f}; ADX: {adx_v:.2f}; Stochastic: {stoch_v:.2f}; MACD: {macd_val:.4f}; "
+                  f"Signal: {signal_val:.4f}; ATR: {atr_v:.4f}; BB_Width: {bb_width:.4f}; Trend M15: {trend_m15}; "
+                  f"Trend H1: {trend_h1}; Expected Move: ±{expected_move:.4f}; Success Probability: {success_probability:.2%}")
 
         # Инициализация переменных
         signal = "WAIT"
@@ -464,6 +477,7 @@ def analyze(symbol, df_5m, df_15m=None, df_1h=None, expiration=1):
         try:
             df_results = pd.read_csv(RESULT_LOG_FILE, usecols=CSV_COLUMNS) if os.path.exists(RESULT_LOG_FILE) else pd.DataFrame(columns=CSV_COLUMNS)
             active_trades = len(df_results[df_results['Outcome'] == 'PENDING']) if not df_results.empty else 0
+            print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] {symbol}: Активных сделок: {active_trades}")
         except Exception as e:
             print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Ошибка чтения {RESULT_LOG_FILE}: {e}")
             send_telegram_message(f"Ошибка чтения {RESULT_LOG_FILE}: {e}")
@@ -826,7 +840,7 @@ def main():
     
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CallbackQueryHandler(button_callback))
-    application.job_queue.run_repeating(check_results, interval=60, first=10)
+    application.job_queue.run_repeating(check_results, interval=30, first=10)  # Уменьшено с 60
     application.job_queue.run_repeating(auto_analyze, interval=300, first=10)
     
     print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Бот успешно запущен и начал анализ рынка!")
