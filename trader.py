@@ -48,9 +48,10 @@ CORRELATION_PAIRS = {
 }
 ACCOUNT_BALANCE = 10000  # Депозит для расчёта риска
 RISK_PER_TRADE = 0.005  # 0.5% на сделку
-MIN_SUCCESS_PROBABILITY = 0.70
-MIN_SIGNAL_STRENGTH = 4.5
+MIN_SUCCESS_PROBABILITY = 0.65  # Снижено с 0.70
+MIN_SIGNAL_STRENGTH = 4.0  # Снижено с 4.5
 MAX_ACTIVE_TRADES = 3
+MIN_REWARD_RISK_RATIO = 1.2  # Снижено с 1.5
 # =================
 
 data_cache = {}
@@ -261,18 +262,18 @@ def update_outcome(symbol, entry_time, entry_price, signal, expiration, stop_los
                 return "WIN", take_profit
             elif any(future_data['low'] <= stop_loss):
                 return "LOSS", stop_loss
-            elif any(future_data['high'] >= entry_price * (1.00005 + 0.00005 * expiration)):
+            elif any(future_data['high'] >= entry_price * (1.00005 + 0.00003 * expiration)):
                 return "WIN", future_data['high'].max()
-            elif any(future_data['low'] <= entry_price * (0.99995 - 0.00005 * expiration)):
+            elif any(future_data['low'] <= entry_price * (0.99995 - 0.00003 * expiration)):
                 return "LOSS", future_data['low'].min()
         elif signal == "SELL":
             if any(future_data['low'] <= take_profit):
                 return "WIN", take_profit
             elif any(future_data['high'] >= stop_loss):
                 return "LOSS", stop_loss
-            elif any(future_data['low'] <= entry_price * (0.99995 - 0.00005 * expiration)):
+            elif any(future_data['low'] <= entry_price * (0.99995 - 0.00003 * expiration)):
                 return "WIN", future_data['low'].min()
-            elif any(future_data['high'] >= entry_price * (1.00005 + 0.00005 * expiration)):
+            elif any(future_data['high'] >= entry_price * (1.00005 + 0.00003 * expiration)):
                 return "LOSS", future_data['high'].max()
         return "PENDING", entry_price
     except Exception as e:
@@ -327,8 +328,8 @@ def analyze(symbol, df_5m, df_15m=None, df_1h=None, expiration=1):
         atr_mean = atr[-10:].mean()
         atr_historical = atr[-20:].mean()
         expected_move = atr_mean * (expiration / 5.0)
-        price_high = price * (1.00005 + 0.00005 * expiration)
-        price_low = price * (0.99995 - 0.00005 * expiration)
+        price_high = price * (1.00005 + 0.00003 * expiration)  # Уменьшен порог
+        price_low = price * (0.99995 - 0.00003 * expiration)  # Уменьшен порог
 
         # Адаптивные пороги
         market_volatility = atr_v / atr_historical
@@ -341,8 +342,8 @@ def analyze(symbol, df_5m, df_15m=None, df_1h=None, expiration=1):
         RSI_SELL_THRESHOLD = min(85, rsi_mean + rsi_std * (1 - 0.5 * market_volatility))
         STOCH_BUY_THRESHOLD = max(10, 15 - 5 * (1 - market_volatility))
         STOCH_SELL_THRESHOLD = min(90, 85 + 5 * (1 - market_volatility))
-        MIN_ADX = max(15, adx_mean * 0.7) if market_volatility > 1.5 else max(10, adx_mean * 0.5)
-        BB_WIDTH_MIN = max(0.00015, bb_width_mean * 0.3) if market_volatility > 1.5 else max(0.0001, bb_width_mean * 0.2)
+        MIN_ADX = max(12, adx_mean * 0.6) if market_volatility > 1.5 else max(10, adx_mean * 0.5)  # Снижено с 15
+        BB_WIDTH_MIN = max(0.0001, bb_width_mean * 0.2) if market_volatility > 1.5 else max(0.00008, bb_width_mean * 0.15)  # Уменьшено
         MIN_ATR = atr_mean * 0.3 * (1 - 0.2 * market_volatility)
 
         print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] {symbol}: market_volatility={market_volatility:.2f}, trend_strength={trend_strength:.2f}, MIN_ADX={MIN_ADX:.2f}, BB_WIDTH_MIN={BB_WIDTH_MIN:.4f}")
@@ -458,7 +459,7 @@ def analyze(symbol, df_5m, df_15m=None, df_1h=None, expiration=1):
             reason += "; Новости, торговля приостановлена"
             print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] {symbol}: {reason}")
             return "WAIT", round(rsi_v, 2), signal_strength, price, atr_v, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val, success_probability, stop_loss, take_profit, lot_size
-        if adx_v < 15 and bb_width < bb_width_mean * 0.8:
+        if adx_v < 12 and bb_width < bb_width_mean * 0.8:  # Уменьшен порог ADX
             reason += "; Рынок во флэте (низкий ADX и узкие Bollinger Bands)"
             print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] {symbol}: {reason}")
             return "WAIT", round(rsi_v, 2), signal_strength, price, atr_v, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val, success_probability, stop_loss, take_profit, lot_size
@@ -521,21 +522,21 @@ def analyze(symbol, df_5m, df_15m=None, df_1h=None, expiration=1):
             reason_add += "Корреляция недоступна, подтверждено трендом M15 (BULLISH); "
 
         if signal_strength >= MIN_SIGNAL_STRENGTH and success_probability >= MIN_SUCCESS_PROBABILITY:
-            if price_high > price * (1.00005 + 0.00005 * expiration):
-                signal_strength += 1
+            if price_high > price * (1.00005 + 0.00003 * expiration):  # Уменьшен порог
+                signal_strength += 0.5  # Меньший прирост
                 reason_add += f"Прогноз роста на {expiration} мин; "
             else:
                 reason_add += f"Прогноз не подтверждает рост на {expiration} мин; "
-                signal_strength -= 1
+                signal_strength -= 0.5  # Меньшее снижение
 
             if signal_strength >= MIN_SIGNAL_STRENGTH:
                 signal = "BUY"
-                stop_loss = price * (0.999 - atr_v * 1.5)
-                take_profit = price * (1.001 + atr_v * 2.0)
+                stop_loss = price * (0.999 - atr_v * 1.2)  # Уменьшен множитель
+                take_profit = price * (1.001 + atr_v * 1.5)  # Уменьшен множитель
                 reward_risk_ratio = abs(take_profit - price) / abs(price - stop_loss)
                 lot_size = min(1.0, RISK_PER_TRADE * ACCOUNT_BALANCE / abs(price - stop_loss))
-                if reward_risk_ratio < 1.5:
-                    reason_add += f"; Низкое соотношение риск/прибыль ({reward_risk_ratio:.2f} < 1.5)"
+                if reward_risk_ratio < MIN_REWARD_RISK_RATIO:
+                    reason_add += f"; Низкое соотношение риск/прибыль ({reward_risk_ratio:.2f} < {MIN_REWARD_RISK_RATIO})"
                     print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] {symbol}: {reason_add}")
                     return "WAIT", round(rsi_v, 2), 0, price, atr_v, reason + "; " + reason_add, rsi_v, adx_v, stoch_v, macd_val, signal_val, success_probability, 0, 0, 0
                 reason = reason + "; " + reason_add
@@ -594,21 +595,21 @@ def analyze(symbol, df_5m, df_15m=None, df_1h=None, expiration=1):
             reason_add += "Корреляция недоступна, подтверждено трендом M15 (BEARISH); "
 
         if signal_strength >= MIN_SIGNAL_STRENGTH and success_probability >= MIN_SUCCESS_PROBABILITY:
-            if price_low < price * (0.99995 - 0.00005 * expiration):
-                signal_strength += 1
+            if price_low < price * (0.99995 - 0.00003 * expiration):  # Уменьшен порог
+                signal_strength += 0.5  # Меньший прирост
                 reason_add += f"Прогноз падения на {expiration} мин; "
             else:
                 reason_add += f"Прогноз не подтверждает падение на {expiration} мин; "
-                signal_strength -= 1
+                signal_strength -= 0.5  # Меньшее снижение
 
             if signal_strength >= MIN_SIGNAL_STRENGTH:
                 signal = "SELL"
-                stop_loss = price * (1.001 + atr_v * 1.5)
-                take_profit = price * (0.999 - atr_v * 2.0)
+                stop_loss = price * (1.001 + atr_v * 1.2)  # Уменьшен множитель
+                take_profit = price * (0.999 - atr_v * 1.5)  # Уменьшен множитель
                 reward_risk_ratio = abs(take_profit - price) / abs(price - stop_loss)
                 lot_size = min(1.0, RISK_PER_TRADE * ACCOUNT_BALANCE / abs(price - stop_loss))
-                if reward_risk_ratio < 1.5:
-                    reason_add += f"; Низкое соотношение риск/прибыль ({reward_risk_ratio:.2f} < 1.5)"
+                if reward_risk_ratio < MIN_REWARD_RISK_RATIO:
+                    reason_add += f"; Низкое соотношение риск/прибыль ({reward_risk_ratio:.2f} < {MIN_REWARD_RISK_RATIO})"
                     print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] {symbol}: {reason_add}")
                     return "WAIT", round(rsi_v, 2), 0, price, atr_v, reason + "; " + reason_add, rsi_v, adx_v, stoch_v, macd_val, signal_val, success_probability, 0, 0, 0
                 reason = reason + "; " + reason_add
@@ -718,7 +719,7 @@ async def auto_analyze(context: ContextTypes.DEFAULT_TYPE):
     print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Запуск автоматического анализа")
     for symbol in SYMBOLS:
         now = datetime.now()
-        if last_signal_time[symbol] and (now - last_signal_time[symbol]).total_seconds() < MIN_SIGNAL_INTERVAL:
+        if last_signal_time[symbol] and (now - last_signal_time[symbol]).seconds < MIN_SIGNAL_INTERVAL:
             print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Пропуск {symbol}: слишком частые сигналы")
             continue
         
