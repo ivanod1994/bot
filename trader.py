@@ -48,7 +48,7 @@ CORRELATION_PAIRS = {
 }
 ACCOUNT_BALANCE = 10000  # Депозит для расчёта риска
 RISK_PER_TRADE = 0.005  # 0.5% на сделку
-MIN_SUCCESS_PROBABILITY = 0.60  # Снижено с 0.70
+MIN_SUCCESS_PROBABILITY = 0.70
 MIN_SIGNAL_STRENGTH = 4.5
 MAX_ACTIVE_TRADES = 3
 # =================
@@ -343,9 +343,9 @@ def analyze(symbol, df_5m, df_15m=None, df_1h=None, expiration=1):
         STOCH_SELL_THRESHOLD = min(90, 85 + 5 * (1 - market_volatility))
         MIN_ADX = max(15, adx_mean * 0.7) if market_volatility > 1.5 else max(10, adx_mean * 0.5)
         BB_WIDTH_MIN = max(0.00015, bb_width_mean * 0.3) if market_volatility > 1.5 else max(0.0001, bb_width_mean * 0.2)
-        MIN_ATR = max(0.0001, atr_mean * 0.3 * (1 - 0.2 * market_volatility))  # Добавлено определение MIN_ATR
+        MIN_ATR = atr_mean * 0.3 * (1 - 0.2 * market_volatility)
 
-        print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] {symbol}: market_volatility={market_volatility:.2f}, trend_strength={trend_strength:.2f}, MIN_ADX={MIN_ADX:.2f}, BB_WIDTH_MIN={BB_WIDTH_MIN:.4f}, MIN_ATR={MIN_ATR:.4f}")
+        print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] {symbol}: market_volatility={market_volatility:.2f}, trend_strength={trend_strength:.2f}, MIN_ADX={MIN_ADX:.2f}, BB_WIDTH_MIN={BB_WIDTH_MIN:.4f}")
 
         # Адаптивные веса условий
         weights = {
@@ -530,13 +530,12 @@ def analyze(symbol, df_5m, df_15m=None, df_1h=None, expiration=1):
 
             if signal_strength >= MIN_SIGNAL_STRENGTH:
                 signal = "BUY"
-                # Расчёт риск-менеджмента
                 stop_loss = price * (0.999 - atr_v * 1.5)
                 take_profit = price * (1.001 + atr_v * 2.0)
                 reward_risk_ratio = abs(take_profit - price) / abs(price - stop_loss)
                 lot_size = min(1.0, RISK_PER_TRADE * ACCOUNT_BALANCE / abs(price - stop_loss))
-                if reward_risk_ratio < 1.2:
-                    reason_add += f"; Низкое соотношение риск/прибыль ({reward_risk_ratio:.2f} < 1.2)"
+                if reward_risk_ratio < 1.5:
+                    reason_add += f"; Низкое соотношение риск/прибыль ({reward_risk_ratio:.2f} < 1.5)"
                     print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] {symbol}: {reason_add}")
                     return "WAIT", round(rsi_v, 2), 0, price, atr_v, reason + "; " + reason_add, rsi_v, adx_v, stoch_v, macd_val, signal_val, success_probability, 0, 0, 0
                 reason = reason + "; " + reason_add
@@ -604,13 +603,12 @@ def analyze(symbol, df_5m, df_15m=None, df_1h=None, expiration=1):
 
             if signal_strength >= MIN_SIGNAL_STRENGTH:
                 signal = "SELL"
-                # Расчёт риск-менеджмента
                 stop_loss = price * (1.001 + atr_v * 1.5)
                 take_profit = price * (0.999 - atr_v * 2.0)
                 reward_risk_ratio = abs(take_profit - price) / abs(price - stop_loss)
                 lot_size = min(1.0, RISK_PER_TRADE * ACCOUNT_BALANCE / abs(price - stop_loss))
-                if reward_risk_ratio < 1.2:
-                    reason_add += f"; Низкое соотношение риск/прибыль ({reward_risk_ratio:.2f} < 1.2)"
+                if reward_risk_ratio < 1.5:
+                    reason_add += f"; Низкое соотношение риск/прибыль ({reward_risk_ratio:.2f} < 1.5)"
                     print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] {symbol}: {reason_add}")
                     return "WAIT", round(rsi_v, 2), 0, price, atr_v, reason + "; " + reason_add, rsi_v, adx_v, stoch_v, macd_val, signal_val, success_probability, 0, 0, 0
                 reason = reason + "; " + reason_add
@@ -645,128 +643,138 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text(f"Ошибка: Не удалось загрузить данные для {symbol}")
         return
     
-    signal, rsi_v, signal_strength, price, atr_v, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val, success_probability, stop_loss, take_profit, lot_size = analyze(symbol, df_5m, df_15m, df_1h)
+    signal, rsi, signal_strength, price, atr, reason, rsi_v, adx_v, stoch_v, macd_v, signal_v, success_prob, stop_loss, take_profit, lot_size = analyze(symbol, df_5m, df_15m, df_1h, expiration=1)
     
     if signal in ["BUY", "SELL"]:
-        last_signal_time[symbol] = datetime.now(LOCAL_TZ)
-        msg = (f"📊 Сигнал для {symbol}\n"
-               f"Тип: {signal}\n"
-               f"Цена: {price:.5f}\n"
-               f"Stop Loss: {stop_loss:.5f}\n"
-               f"Take Profit: {take_profit:.5f}\n"
-               f"Лот: {lot_size:.2f}\n"
-               f"Вероятность успеха: {success_probability:.2%}\n"
-               f"Сила сигнала: {signal_strength:.2f}\n"
-               f"Причина: {reason}")
+        entry_time = datetime.now(LOCAL_TZ).strftime("%H:%M:%S")
+        msg = (f"📊 *Сигнал для {symbol}*\n"
+               f"📈 Направление: {signal}\n"
+               f"💰 Цена входа: {price:.5f}\n"
+               f"🛑 Stop Loss: {stop_loss:.5f}\n"
+               f"🎯 Take Profit: {take_profit:.5f}\n"
+               f"📏 Размер лота: {lot_size:.2f}\n"
+               f"⏰ Время: {entry_time}\n"
+               f"📉 RSI: {rsi_v:.2f}, ADX: {adx_v:.2f}, Stochastic: {stoch_v:.2f}\n"
+               f"📊 MACD: {macd_v:.4f}, Signal: {signal_v:.4f}\n"
+               f"🔍 ATR: {atr:.4f}, Вероятность: {success_prob:.2%}\n"
+               f"💡 Причина: {reason}")
         send_telegram_message(msg, symbol)
         
-        # Логирование сигнала
-        with open(CSV_FILE, 'a', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow([datetime.now(LOCAL_TZ).strftime("%H:%M:%S"), symbol, signal, price, stop_loss, take_profit, lot_size, success_probability, signal_strength, reason, "PENDING", price])
+        # Сохранение сигнала в CSV
+        with open(CSV_FILE, mode='a', newline='') as file:
+            writer = csv.writer(file)
+            writer.writerow([entry_time, symbol, signal, price, stop_loss, take_profit, lot_size, reason, success_prob, "PENDING", price, 0, rsi_v, adx_v, stoch_v, macd_v, signal_v])
         
-        # Логирование в results_log.csv
+        # Сохранение в results_log.csv
         os.makedirs(os.path.dirname(RESULT_LOG_FILE), exist_ok=True)
-        with open(RESULT_LOG_FILE, 'a', newline='') as f:
-            writer = csv.writer(f)
+        with open(RESULT_LOG_FILE, mode='a', newline='') as file:
+            writer = csv.writer(file)
             if os.path.getsize(RESULT_LOG_FILE) == 0:
-                writer.writerow(["Time", "Symbol", "Signal", "Entry_Price", "Stop_Loss", "Take_Profit", "Lot_Size", "Success_Probability", "Signal_Strength", "Reason", "Outcome", "Exit_Price"])
-            writer.writerow([datetime.now(LOCAL_TZ).strftime("%H:%M:%S"), symbol, signal, price, stop_loss, take_profit, lot_size, success_probability, signal_strength, reason, "PENDING", price])
+                writer.writerow(["Entry_Time", "Symbol", "Signal", "Entry_Price", "Stop_Loss", "Take_Profit", "Lot_Size", "Reason", "Success_Probability", "Outcome", "Exit_Price", "Profit", "RSI", "ADX", "Stochastic", "MACD", "MACD_Signal"])
+            writer.writerow([entry_time, symbol, signal, price, stop_loss, take_profit, lot_size, reason, success_prob, "PENDING", price, 0, rsi_v, adx_v, stoch_v, macd_v, signal_v])
         
-        await query.message.reply_text(msg)
+        last_signal_time[symbol] = datetime.now()
     else:
-        await query.message.reply_text(f"Нет сигнала для {symbol}. Причина: {reason}")
+        await query.message.reply_text(f"Сигнал для {symbol}: {signal}\nПричина: {reason}")
+
+async def check_results(context: ContextTypes.DEFAULT_TYPE):
+    if not os.path.exists(CSV_FILE):
+        return
+    
+    df = pd.read_csv(CSV_FILE, names=["Entry_Time", "Symbol", "Signal", "Entry_Price", "Stop_Loss", "Take_Profit", "Lot_Size", "Reason", "Success_Probability", "Outcome", "Exit_Price", "Profit", "RSI", "ADX", "Stochastic", "MACD", "MACD_Signal"])
+    current_time = datetime.now(LOCAL_TZ)
+    
+    for index, row in df.iterrows():
+        if row['Outcome'] != "PENDING":
+            continue
+        entry_time = datetime.strptime(row['Entry_Time'], "%H:%M:%S").replace(
+            year=current_time.year, month=current_time.month, day=current_time.day, tzinfo=LOCAL_TZ
+        )
+        if (current_time - entry_time).total_seconds() / 60 > DELETE_AFTER_MINUTES:
+            outcome, exit_price = update_outcome(row['Symbol'], row['Entry_Time'], row['Entry_Price'], row['Signal'], 1, row['Stop_Loss'], row['Take_Profit'])
+            profit = (exit_price - row['Entry_Price']) * row['Lot_Size'] * 100000 if row['Signal'] == "BUY" else (row['Entry_Price'] - exit_price) * row['Lot_Size'] * 100000
+            df.at[index, 'Outcome'] = outcome
+            df.at[index, 'Exit_Price'] = exit_price
+            df.at[index, 'Profit'] = profit
+            
+            # Обновление results_log.csv
+            df_results = pd.read_csv(RESULT_LOG_FILE) if os.path.exists(RESULT_LOG_FILE) else pd.DataFrame()
+            df_results.loc[df_results['Entry_Time'] == row['Entry_Time'], 'Outcome'] = outcome
+            df_results.loc[df_results['Entry_Time'] == row['Entry_Time'], 'Exit_Price'] = exit_price
+            df_results.loc[df_results['Entry_Time'] == row['Entry_Time'], 'Profit'] = profit
+            df_results.to_csv(RESULT_LOG_FILE, index=False)
+            
+            msg = f"🔍 Результат для {row['Symbol']} ({row['Entry_Time']}): {outcome}\nПрибыль: {profit:.2f}"
+            send_telegram_message(msg, row['Symbol'])
+    
+    df = df[df['Outcome'] == "PENDING"]
+    df.to_csv(CSV_FILE, index=False, header=False)
 
 async def auto_analyze(context: ContextTypes.DEFAULT_TYPE):
+    if not is_active_session():
+        print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Вне активной сессии (08:00-22:00)")
+        return
+    
     print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Запуск автоматического анализа")
     for symbol in SYMBOLS:
-        if last_signal_time[symbol] and (datetime.now(LOCAL_TZ) - last_signal_time[symbol]).seconds < MIN_SIGNAL_INTERVAL:
+        now = datetime.now()
+        if last_signal_time[symbol] and (now - last_signal_time[symbol]).total_seconds() < MIN_SIGNAL_INTERVAL:
+            print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Пропуск {symbol}: слишком частые сигналы")
             continue
-        print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Анализ {symbol} на таймфрейме 5m с экспирацией 1 мин")
+        
+        print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Анализ {symbol} на таймфрейме {DEFAULT_TIMEFRAME} с экспирацией 1 мин")
         df_5m = get_data(symbol, interval="5m", period="3d")
         df_15m = get_data(symbol, interval="15m", period="7d")
         df_1h = get_data(symbol, interval="1h", period="30d")
         if df_5m is None:
+            print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Не удалось загрузить данные для {symbol}")
             continue
-        signal, rsi_v, signal_strength, price, atr_v, reason, rsi_v, adx_v, stoch_v, macd_val, signal_val, success_probability, stop_loss, take_profit, lot_size = analyze(symbol, df_5m, df_15m, df_1h)
+        
+        signal, rsi, signal_strength, price, atr, reason, rsi_v, adx_v, stoch_v, macd_v, signal_v, success_prob, stop_loss, take_profit, lot_size = analyze(symbol, df_5m, df_15m, df_1h, expiration=1)
         
         if signal in ["BUY", "SELL"]:
-            last_signal_time[symbol] = datetime.now(LOCAL_TZ)
-            msg = (f"📊 Сигнал для {symbol}\n"
-                   f"Тип: {signal}\n"
-                   f"Цена: {price:.5f}\n"
-                   f"Stop Loss: {stop_loss:.5f}\n"
-                   f"Take Profit: {take_profit:.5f}\n"
-                   f"Лот: {lot_size:.2f}\n"
-                   f"Вероятность успеха: {success_probability:.2%}\n"
-                   f"Сила сигнала: {signal_strength:.2f}\n"
-                   f"Причина: {reason}")
+            entry_time = datetime.now(LOCAL_TZ).strftime("%H:%M:%S")
+            msg = (f"📊 *Сигнал для {symbol}*\n"
+                   f"📈 Направление: {signal}\n"
+                   f"💰 Цена входа: {price:.5f}\n"
+                   f"🛑 Stop Loss: {stop_loss:.5f}\n"
+                   f"🎯 Take Profit: {take_profit:.5f}\n"
+                   f"📏 Размер лота: {lot_size:.2f}\n"
+                   f"⏰ Время: {entry_time}\n"
+                   f"📉 RSI: {rsi_v:.2f}, ADX: {adx_v:.2f}, Stochastic: {stoch_v:.2f}\n"
+                   f"📊 MACD: {macd_v:.4f}, Signal: {signal_v:.4f}\n"
+                   f"🔍 ATR: {atr:.4f}, Вероятность: {success_prob:.2%}\n"
+                   f"💡 Причина: {reason}")
             send_telegram_message(msg, symbol)
             
-            # Логирование сигнала
-            with open(CSV_FILE, 'a', newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow([datetime.now(LOCAL_TZ).strftime("%H:%M:%S"), symbol, signal, price, stop_loss, take_profit, lot_size, success_probability, signal_strength, reason, "PENDING", price])
+            # Сохранение сигнала в CSV
+            with open(CSV_FILE, mode='a', newline='') as file:
+                writer = csv.writer(file)
+                writer.writerow([entry_time, symbol, signal, price, stop_loss, take_profit, lot_size, reason, success_prob, "PENDING", price, 0, rsi_v, adx_v, stoch_v, macd_v, signal_v])
             
-            # Логирование в results_log.csv
+            # Сохранение в results_log.csv
             os.makedirs(os.path.dirname(RESULT_LOG_FILE), exist_ok=True)
-            with open(RESULT_LOG_FILE, 'a', newline='') as f:
-                writer = csv.writer(f)
+            with open(RESULT_LOG_FILE, mode='a', newline='') as file:
+                writer = csv.writer(file)
                 if os.path.getsize(RESULT_LOG_FILE) == 0:
-                    writer.writerow(["Time", "Symbol", "Signal", "Entry_Price", "Stop_Loss", "Take_Profit", "Lot_Size", "Success_Probability", "Signal_Strength", "Reason", "Outcome", "Exit_Price"])
-                writer.writerow([datetime.now(LOCAL_TZ).strftime("%H:%M:%S"), symbol, signal, price, stop_loss, take_profit, lot_size, success_probability, signal_strength, reason, "PENDING", price])
-
-async def update_results(context: ContextTypes.DEFAULT_TYPE):
-    print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Запуск обновления результатов")
-    if not os.path.exists(RESULT_LOG_FILE):
-        print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Файл {RESULT_LOG_FILE} не существует")
-        send_telegram_message(f"Файл {RESULT_LOG_FILE} не существует, возможно, сигналы ещё не сгенерированы")
-        return
-    try:
-        df = pd.read_csv(RESULT_LOG_FILE)
-        print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Загружено {len(df)} записей из {RESULT_LOG_FILE}")
-        if df.empty:
-            print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Файл {RESULT_LOG_FILE} пуст")
-            send_telegram_message(f"Файл {RESULT_LOG_FILE} пуст")
-            return
-        
-        for idx, row in df.iterrows():
-            if row['Outcome'] != "PENDING":
-                continue
-            outcome, exit_price = update_outcome(row['Symbol'], row['Time'], row['Entry_Price'], row['Signal'], 1, row['Stop_Loss'], row['Take_Profit'])
-            df.at[idx, 'Outcome'] = outcome
-            df.at[idx, 'Exit_Price'] = exit_price
-            if outcome != "PENDING":
-                print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Обновлён исход для {row['Symbol']}: {outcome}, Выходная цена: {exit_price:.5f}")
-                send_telegram_message(f"Сигнал для {row['Symbol']} закрыт: {outcome}, Цена выхода: {exit_price:.5f}")
-        
-        df.to_csv(RESULT_LOG_FILE, index=False)
-        print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Результаты сохранены в {RESULT_LOG_FILE}")
-    
-        # Отчёт по статистике
-        if len(df[df['Outcome'].isin(['WIN', 'LOSS'])]) >= 10:
-            win_rate = len(df[df['Outcome'] == 'WIN']) / len(df[df['Outcome'].isin(['WIN', 'LOSS'])])
-            win_prob = df[df['Outcome'] == 'WIN']['Success_Probability'].mean() if len(df[df['Outcome'] == 'WIN']) > 0 else 0
-            loss_prob = df[df['Outcome'] == 'LOSS']['Success_Probability'].mean() if len(df[df['Outcome'] == 'LOSS']) > 0 else 0
-            msg = (f"📈 Статистика:\n"
-                   f"Win Rate: {win_rate:.2%}\n"
-                   f"Средняя вероятность WIN: {win_prob:.2%}\n"
-                   f"Средняя вероятность LOSS: {loss_prob:.2%}")
-            print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Отправка статистики: {msg}")
-            send_telegram_message(msg)
-    except Exception as e:
-        print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Ошибка при обновлении результатов: {e}")
-        send_telegram_message(f"Ошибка при обновлении результатов: {e}")
+                    writer.writerow(["Entry_Time", "Symbol", "Signal", "Entry_Price", "Stop_Loss", "Take_Profit", "Lot_Size", "Reason", "Success_Probability", "Outcome", "Exit_Price", "Profit", "RSI", "ADX", "Stochastic", "MACD", "MACD_Signal"])
+                writer.writerow([entry_time, symbol, signal, price, stop_loss, take_profit, lot_size, reason, success_prob, "PENDING", price, 0, rsi_v, adx_v, stoch_v, macd_v, signal_v])
+            
+            last_signal_time[symbol] = now
+        else:
+            print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] {symbol}: {signal}, Причина: {reason}")
 
 def main():
     print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Бот запускается...")
     application = Application.builder().token(TELEGRAM_TOKEN).build()
+    
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CallbackQueryHandler(button_callback))
-    application.job_queue.run_repeating(auto_analyze, interval=60, first=10)
-    application.job_queue.run_repeating(update_results, interval=60, first=20)
+    application.job_queue.run_repeating(check_results, interval=60, first=10)
+    application.job_queue.run_repeating(auto_analyze, interval=300, first=10)
+    
     print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Бот успешно запущен и начал анализ рынка!")
-    application.run_polling()
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
