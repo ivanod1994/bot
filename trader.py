@@ -49,7 +49,7 @@ ACCOUNT_BALANCE = 10000
 RISK_PER_TRADE = 0.005
 MIN_SUCCESS_PROBABILITY = 0.55  # Снижено с 0.60
 MIN_SIGNAL_STRENGTH = 3.5  # Снижено с 4.0
-MAX_ACTIVE_TRADES = 5
+MAX_ACTIVE_TRADES = 100
 MIN_REWARD_RISK_RATIO = 1.2
 CSV_COLUMNS = ["Entry_Time", "Symbol", "Signal", "Entry_Price", "Stop_Loss", "Take_Profit", "Lot_Size", "Reason", "Success_Probability", "Outcome", "Exit_Price", "Profit"]
 # =================
