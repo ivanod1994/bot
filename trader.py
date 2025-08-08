@@ -1,8 +1,9 @@
 import time
 import logging
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone as dt_tz
 from typing import Dict, Tuple, List
+import os
 
 import numpy as np
 import pandas as pd
@@ -20,13 +21,12 @@ from telegram.ext import Application, CommandHandler, ContextTypes, JobQueue
 TELEGRAM_TOKEN = "8246979603:AAGSP7b-YRol151GlZpfxyyS34rW5ncZJo4"
 CHAT_ID = "6677680988"
 
-SYMBOLS = ["EURUSD=X", "EURJPY=X", "USDJPY=X", "GBPUSD=X"]  # валютные пары
-INTERVAL_MINUTES = 1  # как часто проверять (в минутах)
+SYMBOLS = ["EURUSD=X", "EURJPY=X", "USDJPY=X", "GBPUSD=X"]
+INTERVAL_MINUTES = 1
 TIMEZONE = "Africa/Algiers"
-ONLY_STRONG = True  # отправлять только сильные сигналы
+ONLY_STRONG = True
 
 LOG_CSV = "signals_log.csv"
-
 tz = pytz.timezone(TIMEZONE)
 
 # ================= ЛОГИ =================
@@ -43,7 +43,6 @@ def to_pair(symbol: str) -> str:
     return symbol.replace("=X", "").upper()[:3] + "/" + symbol.replace("=X", "").upper()[3:6]
 
 def resample_to_3m(df: pd.DataFrame) -> pd.DataFrame:
-    """Агрегируем минутные свечи в 3-минутные (без FutureWarning: use 'min')."""
     if df.index.tz is None:
         df.index = df.index.tz_localize("UTC").tz_convert(tz)
     else:
@@ -123,15 +122,79 @@ def strength_label(direction: str, strength: int, row: pd.Series) -> str:
     if score == 2: return "MEDIUM"
     return "WEAK"
 
-# ================= АНАЛИЗ (ОДНО ЛУЧШЕЕ ОКНО) =================
-async def analyze_and_notify(context: ContextTypes.DEFAULT_TYPE):
-    end = datetime.utcnow()
+# =============== ЛОГИРОВАНИЕ И ТОЧНОСТЬ ===============
+def append_log(symbol: str, direction: str, label: str, price: float, t_utc: datetime):
+    exists = os.path.exists(LOG_CSV)
+    row = {
+        "time_utc": t_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "symbol": symbol,
+        "direction": direction,
+        "label": label,
+        "price": float(price),
+    }
+    df = pd.DataFrame([row])
+    if exists:
+        df.to_csv(LOG_CSV, mode="a", index=False, header=False, encoding="utf-8")
+    else:
+        df.to_csv(LOG_CSV, index=False, encoding="utf-8")
+
+def calc_accuracy(window: int = 50) -> Tuple[int, int, float]:
+    if not os.path.exists(LOG_CSV):
+        return 0, 0, 0.0
+    df = pd.read_csv(LOG_CSV)
+    if df.empty:
+        return 0, 0, 0.0
+
+    df = df.tail(window).copy()
+    df["time_utc"] = pd.to_datetime(df["time_utc"], utc=True)
+    min_time = datetime.now(dt_tz.utc) - timedelta(minutes=90)
+    df = df[df["time_utc"] >= min_time]
+    if df.empty:
+        return 0, 0, 0.0
+
+    hits, total = 0, 0
+    for sym, chunk in df.groupby("symbol"):
+        data = yf.download(
+            sym, period="90m", interval="1m", progress=False, auto_adjust=False
+        )
+        if data is None or data.empty:
+            continue
+        if data.index.tz is None:
+            data.index = data.index.tz_localize("UTC")
+        else:
+            data.index = data.index.tz_convert("UTC")
+
+        for _, r in chunk.iterrows():
+            t3 = r["time_utc"] + timedelta(minutes=3)
+            fut = data[data.index >= t3]
+            if fut.empty:
+                continue
+            fut_close = float(fut["Close"].iloc[0])
+            total += 1
+            if r["direction"] == "UP" and fut_close > r["price"]:
+                hits += 1
+            elif r["direction"] == "DOWN" and fut_close < r["price"]:
+                hits += 1
+
+    acc = (hits / total * 100.0) if total else 0.0
+    return hits, total, acc
+
+# ================= АНАЛИЗ =================
+async def analyze(context: ContextTypes.DEFAULT_TYPE) -> List[dict]:
+    end = datetime.now(dt_tz.utc)
     start = end - timedelta(hours=3)
-    best_signal = None
+    candidates: List[dict] = []
 
     for symbol in SYMBOLS:
         try:
-            raw = yf.download(symbol, start=start, end=end, interval="1m", progress=False)
+            raw = yf.download(
+                symbol,
+                start=start,
+                end=end,
+                interval="1m",
+                progress=False,
+                auto_adjust=False
+            )
             if raw.empty:
                 continue
             df3 = resample_to_3m(raw)
@@ -142,41 +205,82 @@ async def analyze_and_notify(context: ContextTypes.DEFAULT_TYPE):
 
             direction, votes, reasons = indicator_votes(row)
             label = strength_label(direction, votes, row)
-            price = row["Close"]
+            price = float(row["Close"])
 
-            if direction in ("UP", "DOWN"):
-                if label == "STRONG" or not ONLY_STRONG:
-                    score = votes + (1 if row["adx"] >= 25 else 0)
-                    if not best_signal or score > best_signal["score"]:
-                        best_signal = {
-                            "symbol": symbol,
-                            "pair": to_pair(symbol),
-                            "direction": direction,
-                            "label": label,
-                            "price": price,
-                            "rsi": row["rsi"],
-                            "adx": row["adx"],
-                            "score": score
-                        }
+            if direction in ("UP", "DOWN") and (label == "STRONG" or not ONLY_STRONG):
+                score = votes + (1 if row["adx"] >= 25 else 0)
+                candidates.append({
+                    "symbol": symbol,
+                    "pair": to_pair(symbol),
+                    "direction": direction,
+                    "label": label,
+                    "price": price,
+                    "rsi": float(row["rsi"]),
+                    "adx": float(row["adx"]),
+                    "score": int(score),
+                    "t_utc": end,
+                })
         except Exception as e:
             logging.exception(f"Ошибка {symbol}: {e}")
 
-    if best_signal:
+    # сортировка по силе (score) по убыванию
+    candidates.sort(key=lambda x: x["score"], reverse=True)
+    return candidates
+
+async def analyze_and_notify(context: ContextTypes.DEFAULT_TYPE, manual: bool = False):
+    candidates = await analyze(context)
+
+    if manual:
+        if not candidates:
+            return await context.bot.send_message(chat_id=CHAT_ID, text="❌ Сейчас нет подходящих сигналов.")
+        # ТОП-3
+        top = candidates[:3]
+        header = "🛑 РУЧНОЙ ЗАПРОС — ТОП-3 СИГНАЛА"
+        lines = []
+        for i, s in enumerate(top, 1):
+            lines.append(
+                f"{i}) {s['pair']}: *{s['direction']}* ({s['label']}) | "
+                f"Цена `{s['price']:.5f}` | RSI {s['rsi']:.1f} | ADX {s['adx']:.1f}"
+            )
+            # логируем каждый сигнал из топа
+            append_log(s["symbol"], s["direction"], s["label"], s["price"], s["t_utc"])
+        msg = header + "\n" + "\n".join(lines)
+        return await context.bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode="Markdown")
+
+    # плановый режим — один лучший
+    if candidates:
+        s = candidates[0]
         msg = (
-            f"🚨 ЛУЧШИЙ СИГНАЛ {best_signal['pair']}\n"
-            f"Направление: *{best_signal['direction']}* | Сила: *{best_signal['label']}*\n"
-            f"Цена: `{best_signal['price']:.5f}` | RSI: {best_signal['rsi']:.1f} | ADX: {best_signal['adx']:.1f}"
+            f"🚨 ЛУЧШИЙ СИГНАЛ {s['pair']}\n"
+            f"Направление: *{s['direction']}* | Сила: *{s['label']}*\n"
+            f"Цена: `{s['price']:.5f}` | RSI: {s['rsi']:.1f} | ADX: {s['adx']:.1f}"
         )
         await context.bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode="Markdown")
+        append_log(s["symbol"], s["direction"], s["label"], s["price"], s["t_utc"])
 
 # ================= КОМАНДЫ =================
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Бот запущен. Буду присылать только один лучший сигнал за цикл.")
+    await update.message.reply_text(
+        "Бот запущен. Планово шлёт 1 лучший сигнал/цикл.\n"
+        "/status — точность, /force — ТОП-3 сигналов на сейчас."
+    )
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    hits, total, acc = calc_accuracy(window=50)
+    if total == 0:
+        return await update.message.reply_text("Недостаточно свежих данных для оценки точности.")
+    await update.message.reply_text(f"🎯 Точность: {acc:.1f}% ({hits}/{total} попаданий)")
+
+async def cmd_force(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Запускаю внеплановый анализ…")
+    await analyze_and_notify(context, manual=True)
 
 # ================= MAIN =================
 def main():
     application = Application.builder().token(TELEGRAM_TOKEN).build()
     application.add_handler(CommandHandler("start", cmd_start))
+    application.add_handler(CommandHandler("status", cmd_status))
+    application.add_handler(CommandHandler("force", cmd_force))
 
     jq: JobQueue = application.job_queue
     jq.run_repeating(analyze_and_notify, interval=INTERVAL_MINUTES * 60, first=5)
