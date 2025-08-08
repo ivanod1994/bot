@@ -43,15 +43,16 @@ def to_pair(symbol: str) -> str:
     return symbol.replace("=X", "").upper()[:3] + "/" + symbol.replace("=X", "").upper()[3:6]
 
 def resample_to_3m(df: pd.DataFrame) -> pd.DataFrame:
+    """Агрегируем минутные свечи в 3-минутные (без FutureWarning: use 'min')."""
     if df.index.tz is None:
         df.index = df.index.tz_localize("UTC").tz_convert(tz)
     else:
         df.index = df.index.tz_convert(tz)
-    o = df["Open"].resample("3T").first()
-    h = df["High"].resample("3T").max()
-    l = df["Low"].resample("3T").min()
-    c = df["Close"].resample("3T").last()
-    v = df["Volume"].resample("3T").sum()
+    o = df["Open"].resample("3min").first()
+    h = df["High"].resample("3min").max()
+    l = df["Low"].resample("3min").min()
+    c = df["Close"].resample("3min").last()
+    v = df["Volume"].resample("3min").sum()
     out = pd.concat([o, h, l, c, v], axis=1)
     out.columns = ["Open", "High", "Low", "Close", "Volume"]
     return out.dropna()
@@ -69,7 +70,8 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     bb = BollingerBands(close=close, window=20, window_dev=2)
     df["bb_high"], df["bb_low"] = bb.bollinger_hband(), bb.bollinger_lband()
 
-    df["ema20"], df["ema50"] = EMAIndicator(close=close, window=20).ema_indicator(), EMAIndicator(close=close, window=50).ema_indicator()
+    df["ema20"] = EMAIndicator(close=close, window=20).ema_indicator()
+    df["ema50"] = EMAIndicator(close=close, window=50).ema_indicator()
     df["adx"] = ADXIndicator(high=high, low=low, close=close, window=14).adx()
     return df
 
@@ -134,7 +136,8 @@ async def analyze_and_notify(context: ContextTypes.DEFAULT_TYPE):
                 continue
             df3 = resample_to_3m(raw)
             df3 = compute_indicators(df3)
-            if len(df3) < 2: continue
+            if len(df3) < 2:
+                continue
             row = df3.iloc[-1]
 
             direction, votes, reasons = indicator_votes(row)
